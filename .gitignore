@@ -1,0 +1,9 @@
+logs/
+.env
+.env.example
+*.tmp
+__pycache__/
+./tests
+./logs
+./.idea
+
