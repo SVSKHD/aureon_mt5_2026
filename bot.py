@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store, labels
+import signals, notifier, alerts, chart, trader, store, labels, positions
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -289,6 +289,12 @@ def check_ema(tf: str, symbol: str | None = None):
                 state.mark(fk)
             state.mark(key)
     state.checkpoint(tf, newest, symbol)
+    fresh = [(bt, e) for _, bt, e in live]
+    for hook in CANDLE_HOOKS:                                      # positions (TSL, in-trade alerts), monitor, ...
+        hook(symbol, tf, df, lab, fresh)
+
+
+CANDLE_HOOKS: list = [lambda symbol, tf, df, lab, fresh: positions.on_candle(state, symbol, df, lab, fresh)]
 
 
 def _fold_quiet(live):
@@ -312,7 +318,8 @@ def _fold_quiet(live):
 LABELS: dict = {}                                                  # symbol -> labels.Result for the newest closed bar
 LIVE_LABELS = {labels.GAP_WIDENING, labels.PARALLEL, labels.WIDE_GAP, labels.GAP_PEAKED, labels.PULLBACK,
                labels.RE_ENTRY, labels.PULLBACK_FAILED, labels.PRE_CROSS, labels.PRE_CROSS_FAILED}
-EVENT_HOOKS: list = []          # callables (symbol, tf, bar_time, event, df, labels_result) -> extra card fields
+EVENT_HOOKS: list = [lambda symbol, tf, bt, e: positions.event_lines(state, symbol, e)]
+#                        callables (symbol, tf, bar_time, event) -> {"fields": [...], "buttons": [...]}
 
 
 def update_labels(symbol: str, df) -> "labels.Result":
@@ -411,7 +418,37 @@ def status_reply(symbol: str) -> dict:
     return r
 
 
-JSON_COMMANDS: dict = {}                                           # name -> handler(req), registered by features
+def _bars_of(symbol: str):
+    df = signals.fetch(C.TIMEFRAMES[0], symbol=symbol)
+    return labels.prepare(df) if df is not None else None
+
+
+def _trade_user(req: dict) -> str | None:
+    if req.get("user") not in C.DISCORD_ALLOWED_USER_IDS:
+        return "⛔ NOT done — this user is not in DISCORD_ALLOWED_USER_IDS."
+    return None
+
+
+def _close_cmd(req: dict) -> dict:
+    why = _trade_user(req)
+    if why:
+        return {"ok": False, "text": why}
+    reply = trader.close_position(req)
+    log.info("CLOSE %s by %s -> %s", req.get("ticket"), req.get("user"), reply["text"].replace("\n", " | "))
+    return reply
+
+
+def _apply_cmd(req: dict) -> dict:
+    why = _trade_user(req)
+    return {"ok": False, "text": why} if why else positions.apply(state, req)
+
+
+JSON_COMMANDS: dict = {                                            # name -> handler(req); features add more
+    "positions": lambda req: positions.report(state, LABELS, _bars_of),
+    "keep": lambda req: positions.keep(state, req),
+    "apply": _apply_cmd,
+    "close": _close_cmd,
+}
 PLACE_GATES: list = []                                             # callables req -> refusal text or None
 
 
@@ -611,6 +648,7 @@ def main():
                 for tf in C.TIMEFRAMES:
                     check_ema(tf, sym)
             process_commands()
+            positions.track(state, LABELS)                         # opened / closed / MAX POINT giveback
             check_price_alerts(C.TIMEFRAMES[0])
             if not announced:
                 announce_start(); announced = True

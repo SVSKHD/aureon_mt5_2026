@@ -1,4 +1,4 @@
-"""Manual order placement for /place. THE ONLY FILE THAT CAN SEND AN ORDER.
+"""Manual order placement for /place, stop-loss tightening and confirmed closes. THE ONLY FILE THAT CAN SEND AN ORDER.
 It acts on one explicit, confirmed command from you: a market order with a stop-loss and a take-profit.
 Nothing in the signal loop calls this module - a cross never places a trade by itself.
 
@@ -263,3 +263,103 @@ def _journal(order: dict, res, filling: str):
                      symbol=C.logical_symbol(order.get("symbol")) or order.get("symbol"))
     except Exception:
         log.exception("trade journal write failed")
+
+
+# ------------------------------------------------------------------------------ stop-loss moves and closes
+def _position(ticket: int):
+    found = mt5.positions_get(ticket=ticket)
+    return found[0] if found else None
+
+
+def tighter(side: int, new_sl: float, cur_sl: float) -> bool:
+    """True if new_sl protects more than cur_sl. A missing stop (0) is always loosest."""
+    if not cur_sl:
+        return True
+    return new_sl > cur_sl if side > 0 else new_sl < cur_sl
+
+
+def modify_sl(ticket: int, new_sl: float, why: str = "tsl") -> dict:
+    """Move a position's stop-loss. ONLY EVER TIGHTENS it, never widens, never removes (TP is kept as it is).
+    Checks the broker's stops and freeze levels, sends TRADE_ACTION_SLTP, then reads the position back.
+    Returns {"ok", "verified", "old", "new", "text"}. Fails closed: if anything cannot be checked, nothing is sent."""
+    pos = _position(ticket)
+    if pos is None:
+        return {"ok": False, "verified": False, "old": None, "new": new_sl, "text": f"position {ticket} not found"}
+    side = 1 if pos.type == mt5.ORDER_TYPE_BUY else -1
+    info, tick = mt5.symbol_info(pos.symbol), mt5.symbol_info_tick(pos.symbol)
+    old = float(pos.sl or 0.0)
+    base = {"ok": False, "verified": False, "old": old, "new": new_sl}
+    if info is None or tick is None:
+        return {**base, "text": "MT5 cannot give the symbol's price or rules right now"}
+    new_sl = round(float(new_sl), info.digits)
+    base["new"] = new_sl
+    if new_sl <= 0:
+        return {**base, "text": "a stop-loss is never removed"}
+    if not tighter(side, new_sl, old):
+        return {**base, "text": f"{new_sl} would not tighten the current stop {old}"}
+    price = tick.bid if side > 0 else tick.ask
+    room = max(getattr(info, "trade_stops_level", 0), getattr(info, "trade_freeze_level", 0)) * info.point
+    if side * (price - new_sl) <= room:
+        return {**base, "text": f"{new_sl} is within the broker's stop/freeze distance ({room:.{info.digits}f}) of "
+                                f"the price {price:.{info.digits}f}"}
+    order = {"action": mt5.TRADE_ACTION_SLTP, "symbol": pos.symbol, "position": ticket, "sl": new_sl,
+             "tp": float(pos.tp or 0.0), "magic": C.PLACE_MAGIC, "comment": f"aureon {why}"}
+    res = mt5.order_send(order)
+    _journal(order, res, "-")
+    back = _position(ticket)
+    verified = back is not None and abs(float(back.sl or 0) - new_sl) < info.point / 2 + 1e-9
+    if res is None or res.retcode not in (PLACED, DONE) or not verified:
+        code = getattr(res, "retcode", "no answer")
+        return {**base, "text": f"broker said {code} {getattr(res, 'comment', '')}; the position shows SL "
+                                f"{getattr(back, 'sl', '?')}, not {new_sl}"}
+    return {"ok": True, "verified": True, "old": old, "new": new_sl, "text": f"SL {old} → {new_sl}"}
+
+
+def close_position(req: dict) -> dict:
+    """Close one position, after the user pressed Close and then Confirm on a card. Never called by the bot itself.
+    Sends the opposite market deal for the whole volume, then reads back that the position is gone."""
+    if not C.PLACE_ENABLED:
+        return {"ok": False, "text": "❌ NOT closed — trading is switched off (PLACE_ENABLED). Close it in MT5."}
+    try:
+        ticket = int(req["ticket"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "text": "❌ NOT closed — no position ticket."}
+    pos = _position(ticket)
+    if pos is None:
+        return {"ok": False, "text": f"❌ NOT closed — position {ticket} is not open (already closed?)."}
+    acc, term = mt5.account_info(), mt5.terminal_info()
+    if acc is None or term is None:
+        return {"ok": False, "text": "❌ NOT closed — MT5 is not connected. Close it in MT5."}
+    if not getattr(term, "trade_allowed", True):
+        return {"ok": False, "text": "❌ NOT closed — Algo Trading is OFF in the MT5 terminal. Close it in MT5."}
+    if getattr(acc, "trade_mode", -1) != 0 and not C.PLACE_ALLOW_REAL:
+        return {"ok": False, "text": "❌ NOT closed — real account and PLACE_ALLOW_REAL is not set. Close it in MT5."}
+    info, tick = mt5.symbol_info(pos.symbol), mt5.symbol_info_tick(pos.symbol)
+    if info is None or tick is None:
+        return {"ok": False, "text": "❌ NOT closed — no price for the symbol. Close it in MT5."}
+    long_ = pos.type == mt5.ORDER_TYPE_BUY
+    order = {"action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume, "position": ticket,
+             "type": mt5.ORDER_TYPE_SELL if long_ else mt5.ORDER_TYPE_BUY, "price": tick.bid if long_ else tick.ask,
+             "deviation": C.PLACE_DEVIATION_POINTS, "magic": C.PLACE_MAGIC, "comment": "aureon close",
+             "type_time": mt5.ORDER_TIME_GTC}
+    last = "no answer from MT5"
+    for name in _fillings(info, "auto"):
+        order["type_filling"] = getattr(mt5, FILLING[name])
+        check = mt5.order_check(order)
+        if check is None:
+            return {"ok": False, "text": f"❌ NOT closed — MT5 could not pre-check it ({mt5.last_error()})."}
+        if check.retcode != 0:
+            last = f"{check.retcode} {check.comment}"
+            continue
+        res = mt5.order_send(order)
+        _journal(order, res, name)
+        if res is not None and res.retcode in (PLACED, DONE, PARTIAL):
+            left = _position(ticket)
+            if left is None:
+                return {"ok": True, "text": f"✅ CLOSED position {ticket} · {pos.volume:g} {C.logical_symbol(pos.symbol) or pos.symbol} "
+                                            f"@ ~{order['price']:.{info.digits}f}"}
+            return {"ok": True, "text": f"⚠️ Broker answered but position {ticket} still shows {left.volume:g} lot — CHECK MT5."}
+        last = f"{getattr(res, 'retcode', '?')} {getattr(res, 'comment', '')}"
+        if not str(last).startswith(str(BAD_FILLING)):
+            break
+    return {"ok": False, "text": f"❌ NOT closed — broker said: {last}. Close it in MT5."}

@@ -285,10 +285,28 @@ def run(bars: pd.DataFrame, cfg: dict | None = None, start: int | None = None) -
 # --------------------------------------------------------------------------------------- trailing stop
 def tsl_steps(bars: pd.DataFrame, start: int, side: int, buffer_at, entry: float | None = None,
               cfg: dict | None = None) -> list[dict]:
+    return tsl_track(bars, start, side, buffer_at, entry, cfg)[0]
+
+
+def next_step_text(pb: "Pullback | None", side: int) -> str:
+    """What has to happen for the next trailing-stop step (for /positions)."""
+    if pb is None:
+        return "-"
+    far = "above" if side > 0 else "below"
+    if pb.state == "reentered":
+        return f"a candle closing {far} {pb.pre_extreme:.2f}"
+    if pb.state == "pullback":
+        return f"RE-ENTRY, then a candle closing {far} {pb.pre_extreme:.2f} (stop would go to {pb.pb_extreme:.2f} ∓ buffer)"
+    return "a pullback, a RE-ENTRY, then a close beyond the trend extreme"
+
+
+def tsl_track(bars: pd.DataFrame, start: int, side: int, buffer_at, entry: float | None = None,
+              cfg: dict | None = None) -> tuple[list[dict], "Pullback | None"]:
     """Stepped trailing stop for a position on `side` opened at bar `start` (its close, or `entry`).
     The trend extreme is tracked from the open. After a RE-ENTRY, a candle closing beyond the pre-pullback
     extreme moves the stop to the pullback's extreme -/+ buffer. buffer_at(i) -> buffer in price units at bar i.
-    Returns [{"i","time","sl","pullback_extreme","pre_extreme"}] in order. No breakeven step (spec 7.2)."""
+    Returns ([{"i","time","sl","pullback_extreme","pre_extreme"}] in order, the pullback machine after the last bar).
+    No breakeven step (spec 7.2)."""
     cfg = cfg or DEFAULTS
     cols = {k: bars[k].to_numpy(dtype=float) for k in ("close", "clean_high", "clean_low", "atr", "ema_f", "ema_s")}
     rows = [{k: cols[k][i] for k in cols} for i in range(len(bars))]
@@ -298,12 +316,12 @@ def tsl_steps(bars: pd.DataFrame, start: int, side: int, buffer_at, entry: float
         if np.isnan(cols["atr"][i]):
             continue
         if side * (cols["ema_f"][i] - cols["ema_s"][i]) <= 0:
-            break                                            # the trend turned against the position: no more steps
+            return out, None                                 # the trend turned against the position: no more steps
         for label, extra in pb.step(rows[i], rows[i - 1], cfg):
             if label == STEP:
                 sl = extra["pullback_extreme"] - side * buffer_at(i)
                 out.append({"i": i, "time": bars["time"].iloc[i], "sl": float(sl), **extra})
-    return out
+    return out, pb
 
 
 # ------------------------------------------------------------------------------------------------ text

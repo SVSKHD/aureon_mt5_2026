@@ -14,6 +14,8 @@ class World:
     connected = True
     initialised = False
     symbols = {"XAUUSD": True, "XAGUSD": True}   # broker symbols that exist -> visible in Market Watch
+    tick_override = {}        # {symbol: bid} live price instead of the sine (position tests)
+    balance = 10000.0
     freeze_level = 0
     frozen_tick = None        # real time of the last tick when the market is closed (None = live market)
     m1_override = {}          # {bar open stamp: (low, high)}
@@ -38,6 +40,7 @@ class World:
         cls.stamp_offset, cls.connected, cls.initialised, cls.frozen_tick = timedelta(hours=2), True, False, None
         cls.m1_override, cls.ticks, cls.history_bars = {}, [], 4000
         cls.symbols, cls.freeze_level = {"XAUUSD": True, "XAGUSD": True}, 0
+        cls.tick_override, cls.balance = {}, 10000.0
         cls.orders, cls.retcodes, cls.algo_trading, cls.filling_mode = [], [], True, 1
         cls.account_mode, cls.positions, cls.deals = 0, [], []
         cls.check_unavailable = cls.drop_sltp = cls.sltp_fails = False
@@ -95,6 +98,8 @@ def install():
         t = _Tick()
         st = World.stamp(World.frozen_tick or World.now)
         t.time, t.time_msc, t.bid = int(st), int(st * 1000), round(price(st, _s), 2)   # real ticks come at 2 digits
+        if _s in World.tick_override:
+            t.bid = World.tick_override[_s]
         t.ask = round(t.bid + World.spread, 2)
         return t
 
@@ -111,8 +116,12 @@ def install():
                                      trade_stops_level=50, trade_freeze_level=World.freeze_level,
                                      filling_mode=World.filling_mode)
     m.symbol_info = symbol_info
-    m.account_info = lambda: types.SimpleNamespace(login=555, server="Fake-Server", trade_mode=World.account_mode,
-                                                   trade_allowed=True, currency="USD")
+    def account_info():
+        open_pl = sum(p.profit for p in World.positions)
+        return types.SimpleNamespace(login=555, server="Fake-Server", trade_mode=World.account_mode, trade_allowed=True,
+                                     currency="USD", balance=World.balance, equity=World.balance + open_pl,
+                                     margin_free=World.balance + open_pl - 1000)
+    m.account_info = account_info
     m.TRADE_ACTION_DEAL, m.TRADE_ACTION_SLTP, m.ORDER_TYPE_BUY, m.ORDER_TYPE_SELL, m.ORDER_TIME_GTC = 1, 6, 0, 1, 0
     m.ORDER_FILLING_FOK, m.ORDER_FILLING_IOC, m.ORDER_FILLING_RETURN = 0, 1, 2
     m.order_check = lambda req: None if World.check_unavailable else types.SimpleNamespace(retcode=0, comment="ok")
@@ -120,10 +129,19 @@ def install():
     m.order_calc_margin = lambda typ, _s, vol, p: round(vol * p * 100 / 100, 2)      # 100 oz contract, 1:100
     def positions_get(symbol=None, ticket=None):
         World.calls.append(("positions_get", symbol))
-        return tuple(p for p in World.positions if (symbol is None or getattr(p, "symbol", symbol) == symbol)
-                     and (ticket is None or p.ticket == ticket))
+        out = []
+        for p in World.positions:
+            if (symbol is None or getattr(p, "symbol", symbol) == symbol) and (ticket is None or p.ticket == ticket):
+                t = tick(getattr(p, "symbol", "XAUUSD"))
+                if t is not None and hasattr(p, "type"):
+                    p.price_current = t.bid if p.type == 0 else t.ask
+                    p.profit = round((p.price_current - p.price_open) * (1 if p.type == 0 else -1) * p.volume * 100, 2)
+                out.append(p)
+        return tuple(out)
     m.positions_get = positions_get
-    m.history_deals_get = lambda a, b: tuple(World.deals)
+    def history_deals_get(a, b, position=None):
+        return tuple(d for d in World.deals if position is None or getattr(d, "position_id", None) == position)
+    m.history_deals_get = history_deals_get
 
     def order_send(req):
         World.orders.append(dict(req))
@@ -136,6 +154,10 @@ def install():
             return types.SimpleNamespace(retcode=10009, comment="done", order=0, price=0, volume=0)
         code = World.retcodes.pop(0) if World.retcodes else 10009
         ticket = 1000 + len(World.orders)
+        if req.get("position"):                                   # a closing deal
+            if code in (10009, 10010):
+                close(req["position"], req["price"], reason=3)
+            return types.SimpleNamespace(retcode=code, comment="done", order=ticket, price=req["price"], volume=req["volume"])
         if code in (10009, 10010):
             vol = req["volume"] if code == 10009 else round(req["volume"] * 0.6, 2)
             keep = not World.drop_sltp
@@ -147,6 +169,7 @@ def install():
         return types.SimpleNamespace(retcode=code, comment="done" if code == 10009 else f"code {code}",
                                      order=ticket, price=req["price"], volume=req["volume"])
     m.order_send = order_send
+    m.DEAL_ENTRY_IN, m.DEAL_ENTRY_OUT = 0, 1
     def symbol_select(_s, _b):
         World.calls.append(("symbol_select", _s))
         return _s in World.symbols
@@ -180,3 +203,28 @@ def install():
     m.copy_rates_from, m.copy_rates_range, m.copy_ticks_range = copy_rates_from, copy_rates_range, copy_ticks_range
     sys.modules["MetaTrader5"] = m
     return m
+
+
+def open_position(ticket, side, price_open, sl=0.0, tp=0.0, volume=0.5, symbol="XAUUSD", opened=None, magic=0):
+    """A position as if opened from the MT5 app (any magic number). opened = real UTC datetime (default now)."""
+    p = types.SimpleNamespace(ticket=ticket, identifier=ticket, volume=volume, price_open=price_open, sl=sl, tp=tp,
+                              symbol=symbol, type=0 if side > 0 else 1, magic=magic,
+                              time=int(World.stamp(opened)), price_current=price_open, profit=0.0, swap=0.0)
+    World.positions.append(p)
+    World.deals.append(types.SimpleNamespace(position_id=ticket, entry=0, price=price_open, volume=volume, profit=0.0,
+                                             swap=0.0, commission=-2.0, fee=0.0, reason=0, type=p.type,
+                                             time=p.time, symbol=symbol))
+    return p
+
+
+def close(ticket, price_close, reason=4):
+    """The broker closes a position (reason 4 = SL, 5 = TP, 0 = manual in the terminal, 3 = expert)."""
+    for p in list(World.positions):
+        if p.ticket == ticket:
+            World.positions.remove(p)
+            sign = 1 if p.type == 0 else -1
+            profit = round((price_close - p.price_open) * sign * p.volume * 100, 2)
+            World.deals.append(types.SimpleNamespace(position_id=ticket, entry=1, price=price_close, volume=p.volume,
+                                                     profit=profit, swap=0.0, commission=-2.0, fee=0.0, reason=reason,
+                                                     type=1 - p.type, time=int(World.stamp()), symbol=p.symbol))
+            World.balance += profit - 4.0

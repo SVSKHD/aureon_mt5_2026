@@ -21,6 +21,10 @@ def render(df, tf: str, title: str, to_ist, mark_last: str | None = None, price_
         import matplotlib.pyplot as plt
         from datetime import timedelta
 
+        df = df.copy()
+        for p in EMA_COLORS:                                      # candles without EMA columns: compute them
+            if f"ema{p}" not in df:
+                df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
         d = df.tail(bars or C.CHART_BARS).reset_index(drop=True)
         x = range(len(d))
         fig, ax = plt.subplots(figsize=(10, 5.4), dpi=100)

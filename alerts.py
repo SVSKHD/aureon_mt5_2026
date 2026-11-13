@@ -266,7 +266,9 @@ def can_trade(user_id: int, channel_id: int) -> bool:
     return bool(C.DISCORD_ALLOWED_USER_IDS) and user_id in C.DISCORD_ALLOWED_USER_IDS and authorised(user_id, channel_id)
 
 
-EXTRA_COMMANDS: list = []          # (name, description): simple [symbol] commands registered by features
+EXTRA_COMMANDS: list = [           # (name, description): simple [symbol] commands; the bot loop does the work
+    ("positions", "Open positions, stops, next trailing step, account totals"),
+]
 
 
 def build_discord_client():
