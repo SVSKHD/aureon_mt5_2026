@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store, labels, positions, monitor
+import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -484,7 +484,7 @@ def refresh_monitors():
     for sym in C.enabled_symbols():
         if monitor.active(state, sym):
             monitor.refresh(state, sym, LABELS.get(sym), LAST_DF.get(sym))
-PLACE_GATES: list = []                                             # callables req -> refusal text or None
+PLACE_GATES: list = [weekend.place_gate]                           # callables req -> refusal text or None
 
 
 def handle_json_command(req: dict) -> dict:
@@ -687,6 +687,7 @@ def main():
             process_commands()
             positions.track(state, LABELS)                         # opened / closed / MAX POINT giveback
             refresh_monitors()
+            weekend.check(state)                                   # Friday warnings (warn only, never closes)
             check_price_alerts(C.TIMEFRAMES[0])
             if not announced:
                 announce_start(); announced = True
