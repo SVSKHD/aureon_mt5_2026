@@ -306,6 +306,52 @@ class Failures(Up):
             self.assertNotIn(TOKEN, b)
 
 
+class Headers(Up):
+    def test_every_request_carries_the_json_content_type_and_the_bearer(self):
+        self.make_records(3)
+        self.up().run_pass()
+        self.assertTrue(self.server.calls)
+        routes = {c["route"] for c in self.server.calls}
+        self.assertEqual(routes, {uploader.RECORDS_ROUTE, uploader.BARS_ROUTE})
+        for c in self.server.calls:
+            h = c["headers"]
+            self.assertEqual(h["Content-Type"], "application/json")    # the server answers 415 without it
+            self.assertEqual(h["Content-Encoding"], "gzip")
+            self.assertEqual(h["Authorization"], f"Bearer {TOKEN}")
+
+    def test_415_is_logged_once_and_not_retried_in_a_loop(self):
+        self.make_records(3)
+        u = self.up()
+        self.server.script = [415, 415]
+        with self.assertLogs("uploader", level="WARNING") as logs:
+            self.assertEqual(u.run_pass(), uploader.AUTH_RETRY)    # paused: next try in 5 minutes
+            self.assertEqual(u.run_pass(), uploader.AUTH_RETRY)
+        self.assertEqual(len(self.server.calls), 2)                 # one try per pass, no halving storm
+        self.assertEqual(len([m for m in logs.output if "415" in m]), 1)
+        self.assertEqual(uploader.load_cursor(), {})                # nothing skipped ...
+        self.assertEqual(glob.glob(os.path.join(C.RECORD_DIR, "rejected-*.jsonl")), [])   # ... or rejected
+        bot.deliver_notices()
+        failing = [p for p in Http.to("discord") if "Record upload FAILING" in p["embeds"][0]["title"]]
+        self.assertEqual(len(failing), 1)
+        self.assertIn("415", failing[0]["embeds"][0]["description"])
+        u.run_pass()                                                # fixed: everything goes through
+        store.flush(); u.run_pass()                                 # incl. the failing/recovered records
+        self.assertEqual(uploader.backlog(), 0)
+        self.assertEqual(len(self.received_ids()), len(set(self.received_ids())))
+
+    def test_backfill_stops_at_once_on_415_and_401(self):
+        bars = backfill.to_bars(backfill.from_csv(SAMPLE), None)[:10]
+        for code in (415, 401):
+            self.server.calls.clear()
+            self.server.script = [code]
+            with mock.patch.object(backfill.time, "sleep") as nap, self.assertRaises(SystemExit) as e:
+                backfill.send(bars, "XAUUSD", "M30", "csv", client=uploader.Client(URL, TOKEN, 5),
+                              out=lambda *a: None)
+            self.assertIn(str(code), str(e.exception))
+            self.assertEqual(len(self.server.calls), 1)
+            nap.assert_not_called()
+
+
 class Bars(Up):
     def test_one_bar_record_per_closed_candle_with_the_bot_values(self):
         self.enable("XAGUSD", False)

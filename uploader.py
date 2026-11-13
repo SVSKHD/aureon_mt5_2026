@@ -13,7 +13,8 @@ Routes: kind "bar" rows -> POST /api/trading/mt5/bars (contiguous runs per symbo
 POST /api/trading/mt5/records. Delivery is at-least-once; the server is idempotent (record_id / symbol+tf+ts).
 
 Failures: timeout / connection error / 5xx / 503 -> keep the cursor, back off 15 s doubling to 5 min. 429 -> wait
-Retry-After. 401 -> stop, retry every 5 min only, notice at once. 413 / 422 for a whole batch -> halve it; a single
+Retry-After. 401 -> stop, retry every 5 min only, notice at once. 415 (wrong Content-Type/Encoding: our bug, the
+same for every request) -> the same pause: logged once, no retry loop, nothing pushed into the rejected file. 413 / 422 for a whole batch -> halve it; a single
 row that is still refused goes to logs/records/rejected-YYYY-MM.jsonl and is skipped, so one bad row can never
 block the queue. Rows the server lists as rejected are written there too.
 
@@ -42,8 +43,16 @@ class Transient(Exception):
         self.why, self.wait = why, wait
 
 
-class AuthFailed(Exception):
-    pass
+class Paused(Exception):
+    """Stop sending; try again only every AUTH_RETRY seconds and raise the notice at once."""
+
+
+class AuthFailed(Paused):
+    """401: the server refused the token."""
+
+
+class ClientBug(Paused):
+    """415: the request itself is wrong (Content-Type / Content-Encoding). A bug on our side: no retry loop."""
 
 
 # ------------------------------------------------------------------------------------------- HTTP client
@@ -55,7 +64,7 @@ class Client:
         return f"Client({self.url!r})"
 
     def post(self, route: str, payload: dict) -> dict:
-        """POST gzip JSON. Returns the 200 body. Raises Transient, AuthFailed, or Refused (413/422)."""
+        """POST gzip JSON. Returns the 200 body. Raises Transient, AuthFailed (401), ClientBug (415) or Refused (413/422)."""
         body = gzip.compress(json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8"))
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json",
                    "Content-Encoding": "gzip"}
@@ -71,6 +80,8 @@ class Client:
                 return {}
         if code == 401:
             raise AuthFailed(f"401 on {route}")
+        if code == 415:
+            raise ClientBug(f"415 on {route}")
         if code in (413, 422):
             raise Refused(code)
         if code == 429:
@@ -231,7 +242,7 @@ class Uploader:
                 return d1, err
             d2, err = self._deliver(rows[half:], send)
             return half + d2, err
-        except (Transient, AuthFailed) as e:
+        except (Transient, Paused) as e:
             return 0, e
 
     # -- one pass -------------------------------------------------------------------------------------
@@ -263,7 +274,7 @@ class Uploader:
                         sent_lines += done
                     if err:
                         raise err
-        except AuthFailed as e:
+        except Paused as e:
             self._failed(str(e), auth=True)
             return AUTH_RETRY
         except Transient as e:
@@ -318,8 +329,14 @@ class Uploader:
         self.auth_failed = auth
         if not self.notified and (auth or now - self.failing_since >= NOTICE_AFTER):
             self.notified = True
-            what = ("the server refused the token (401). Sending is paused and retried every 5 minutes; "
-                    "check ASSEMBLER_RECORDS_TOKEN") if auth else f"{why}, for {(now - self.failing_since) / 60:.0f} min"
+            if not auth:
+                what = f"{why}, for {(now - self.failing_since) / 60:.0f} min"
+            elif why.startswith("415"):
+                what = ("the server refused the request format (415, a bug in the bot's uploader). Sending is "
+                        "paused and retried every 5 minutes")
+            else:
+                what = ("the server refused the token (401). Sending is paused and retried every 5 minutes; "
+                        "check ASSEMBLER_RECORDS_TOKEN")
             _notice("upload_failing", "Record upload FAILING",
                     f"Uploads to the Assembler API are failing: {what}. Nothing else is affected: records keep "
                     f"being written to logs/records/ and will be sent when it recovers (backlog {backlog()} rows).")

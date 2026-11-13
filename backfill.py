@@ -64,6 +64,8 @@ def send(bars: list[dict], symbol: str, timeframe: str, source: str, client: U.C
             try:
                 res = client.post(U.BARS_ROUTE, body)
                 break
+            except U.Paused as e:                               # 401 / 415: retrying cannot help
+                raise SystemExit(f"stopped at bar {k}: {e} (check ASSEMBLER_RECORDS_TOKEN; a 415 is a bug)")
             except U.Transient as e:
                 wait = e.wait or min(15 * 2 ** attempt, 300)
                 out(f"  {e.why}; retrying in {wait:.0f} s")
