@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store
+import signals, notifier, alerts, chart, trader, store, labels
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -239,7 +239,8 @@ def check_ema(tf: str, symbol: str | None = None):
     live, missed, missed_bars = [], [], 0                        # (key, bar_time, event)
     seen_now = set()                                               # episode-keyed events: once per replay too
     eval_from = df["time"].iloc[len(df) - todo]
-    for bar_time, e in candle_events(df, todo, tf, symbol):
+    lab = update_labels(symbol, df)
+    for bar_time, e in candle_events(df, todo, tf, symbol, lab):
         bar_close = bar_time.to_pydatetime() + timedelta(minutes=bar_min)
         is_missed = (now_srv - bar_close).total_seconds() > C.MISSED_GRACE_SECONDS
         key = f"{symbol}:{tf}:{e['type']}:{e['dir']}:{e.get('episode', str(bar_time))}"
@@ -266,31 +267,111 @@ def check_ema(tf: str, symbol: str | None = None):
         log.info("%s %s: %d missed bars, no signals in them", symbol, tf, missed_bars)
 
     charts = {}                                                    # one picture per candle, shared by its events
-    for key, bt, e in live:
-        image = None
-        if C.CHART_ENABLED and e["type"] in notifier.PINGS:
-            if bt not in charts:
-                charts[bt] = chart.render(df[df["time"] <= bt], tf, notifier.event_caption(tf, bt, e, symbol),
-                                          signals.to_ist, mark_last=e["dir"] if e["dir"] in ("BULL", "BEAR") else None,
-                                          symbol=symbol)
-            image = charts[bt]
-        record_event(symbol, tf, bt, e)
-        notifier.deliver(state, format_live(tf, bt, e, symbol, missed=(todo <= 2 and bt != newest), image=image), key=key)
-        state.mark(key)
+    for bt, group in _fold_quiet(live):
+        for key, e, folded in group:
+            image = None
+            if C.CHART_ENABLED and e["type"] in notifier.PINGS:
+                if bt not in charts:
+                    charts[bt] = chart.render(df[df["time"] <= bt], tf, notifier.event_caption(tf, bt, e, symbol),
+                                              signals.to_ist, mark_last=e["dir"] if e["dir"] in ("BULL", "BEAR") else None,
+                                              symbol=symbol)
+                image = charts[bt]
+            for _, fe in folded:
+                record_event(symbol, tf, bt, fe)
+            record_event(symbol, tf, bt, e)
+            msg = format_live(tf, bt, e, symbol, missed=(todo <= 2 and bt != newest), image=image)
+            if folded:
+                msg["fields"].append(("Also on this candle", " · ".join(
+                    f"{notifier.TITLES.get(fe['type'], fe['type'])} {notifier.ARROW.get(fe['dir'], fe['dir'])}"
+                    for _, fe in folded), False))
+            notifier.deliver(state, msg, key=key)
+            for fk, _ in folded:
+                state.mark(fk)
+            state.mark(key)
     state.checkpoint(tf, newest, symbol)
 
 
-def candle_events(df, todo: int, tf: str, symbol: str):
-    """(bar_time, event) for every candle in the last `todo` closed candles, oldest first."""
+def _fold_quiet(live):
+    """Per candle: when an #alerts event fires, the quiet (#updates) labels of the same candle ride along on its card
+    instead of being a second message. Yields (bar_time, [(key, event, [(folded_key, folded_event)])])."""
+    order, by_bar = [], {}
+    for key, bt, e in live:
+        if bt not in by_bar:
+            order.append(bt); by_bar[bt] = []
+        by_bar[bt].append((key, e))
+    for bt in order:
+        items = by_bar[bt]
+        loud = [(k, e) for k, e in items if notifier.CHANNEL.get(e["type"], "alerts") == "alerts"]
+        quiet = [(k, e) for k, e in items if notifier.CHANNEL.get(e["type"], "alerts") != "alerts"]
+        if loud and quiet:
+            yield bt, [(loud[0][0], loud[0][1], quiet)] + [(k, e, []) for k, e in loud[1:]]
+        else:
+            yield bt, [(k, e, []) for k, e in items]
+
+
+LABELS: dict = {}                                                  # symbol -> labels.Result for the newest closed bar
+LIVE_LABELS = {labels.GAP_WIDENING, labels.PARALLEL, labels.WIDE_GAP, labels.GAP_PEAKED, labels.PULLBACK,
+               labels.RE_ENTRY, labels.PULLBACK_FAILED, labels.PRE_CROSS, labels.PRE_CROSS_FAILED}
+EVENT_HOOKS: list = []          # callables (symbol, tf, bar_time, event, df, labels_result) -> extra card fields
+
+
+def update_labels(symbol: str, df) -> "labels.Result":
+    """Re-run the label engine over every closed candle we hold. Pure and deterministic, so a restart rebuilds
+    exactly the same label, pullback and TSL state."""
+    res = labels.run(labels.prepare(df))
+    LABELS[symbol] = res
+    return res
+
+
+def _dir(side: int) -> str:
+    return "BULL" if side > 0 else "BEAR"
+
+
+def label_event(le: dict) -> dict:
+    """labels.py event -> the bot's event dict (type/dir/price + details)."""
+    e = {k: v for k, v in le.items() if k not in ("i", "time", "label", "side")}
+    e["type"] = le["label"]
+    if le["label"] in (labels.PRE_CROSS, labels.PRE_CROSS_FAILED):
+        e["dir"] = _dir(le.get("expect", -le["side"]))               # the cross it is waiting for
+        e["episode"] = f"{le['pair']}:{le['time']}"
+    else:
+        e["dir"] = "LONG" if le["side"] > 0 else "SHORT"
+    return e
+
+
+def candle_events(df, todo: int, tf: str, symbol: str, lab=None):
+    """(bar_time, event) for every candle in the last `todo` closed candles, oldest first: the cross and EMA200
+    events from signals.detect(), then the labels of that candle."""
+    by_time: dict = {}
+    for le in (lab.events if lab else []):
+        by_time.setdefault(le["time"], []).append(le)
     for back in range(todo - 1, -1, -1):                           # oldest -> newest
         sub = df.iloc[:len(df) - back]
         bar_time = sub["time"].iloc[-1]
+        here = by_time.get(bar_time, [])
+        cross = next((le for le in here if le["label"] == labels.CROSS), None)
         for e in signals.detect(sub):
+            if e["type"].startswith("CROSS") and cross:          # the label engine adds the tag and what finished
+                e.update(tag=cross["tag"], lesser_gap=cross["lesser_gap"], finished=cross["finished"])
             yield bar_time, e
+        for le in here:
+            if le["label"] in LIVE_LABELS:
+                yield bar_time, label_event(le)
+
+
+def market_status(symbol: str) -> str:
+    res = LABELS.get(symbol)
+    return labels.status_line(res.state) if res else ""
 
 
 def format_live(tf, bt, e, symbol, missed=False, image=None):
-    return notifier.format_event(tf, bt, e, missed=missed, image=image, symbol=symbol)
+    extra, buttons = [], []
+    for hook in EVENT_HOOKS:
+        out = hook(symbol, tf, bt, e) or {}
+        extra += out.get("fields", [])
+        buttons += out.get("buttons", [])
+    return notifier.format_event(tf, bt, e, missed=missed, image=image, symbol=symbol, status=market_status(symbol),
+                                 extra=extra, buttons=buttons or None)
 
 
 def record_event(symbol, tf, bt, e):
@@ -319,7 +400,7 @@ def chart_reply(symbol: str) -> dict:
             "image": chart.render(df, tf, title, signals.to_ist, price_line=price, symbol=symbol)}
 
 
-STATUS_LINES: list = []                                            # callables symbol -> str, appended by features
+STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else ""]
 
 
 def status_reply(symbol: str) -> dict:

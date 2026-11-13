@@ -153,6 +153,31 @@ class Channels(V170):
         self.assertEqual(bot.state.d["pending"][0]["symbol"], "XAUUSD")
 
 
+class LabelAlerts(V170):
+    def test_labels_are_sent_once_with_the_market_status_line(self):
+        bot.check_ema("M30")
+        for _ in range(80):
+            self.to_close(); bot.check_ema("M30")
+        cards = [p["embeds"][0] for p in Http.to("discord") if "embeds" in p]
+        names = " ".join(c["title"] for c in cards)
+        for label in ("GAP WIDENING", "WIDE GAP", "GAP PEAKED", "CROSS"):
+            self.assertIn(label, names)
+        live = [c for c in cards if "MISSED" not in c["title"] and "online" not in c["title"]]
+        self.assertTrue(all(any(f["name"] == "Market now" for f in c["fields"]) for c in live))
+        quiet = {"GAP WIDENING", "PARALLEL RUNNING", "WIDE GAP", "PULLBACK STARTED", "RE-ENTRY"}
+        for p in Http.to("slack"):                                # #updates labels never reach Slack on their own
+            self.assertFalse(any(p["text"].endswith(q + " ▲ LONG") or p["text"].endswith(q + " ▼ SHORT")
+                                 for q in quiet), p["text"])
+        n = len(Http.sent)
+        bot.state = notifier.State(); bot.LABELS.clear(); bot.check_ema("M30")   # restart: no repeats
+        self.assertEqual(len(Http.sent), n)
+
+    def test_status_shows_the_market_line(self):
+        bot.check_ema("M30")
+        r = self.json_cmd("status")
+        self.assertIn("Market:", r["text"]); self.assertIn("candles since the cross", r["text"])
+
+
 class Records(V170):
     def test_every_event_and_alert_produces_exactly_one_record(self):
         bot.check_ema("M30"); self.run_until_event()
