@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader
+import signals, notifier, alerts, chart, trader, store
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -35,9 +35,15 @@ BANNER = r"""
 """
 
 
+def syms() -> str:
+    """Title prefix for account-wide notices: every enabled symbol."""
+    return "/".join(C.enabled_symbols())
+
+
 def print_banner():
     os.system("")                                 # enable ANSI colours on Windows
-    print(f"{GREEN}{BANNER}   {C.SYMBOL} · EMA {C.EMA_FAST}/{C.EMA_SLOW}/{C.EMA_TREND} · {'/'.join(C.TIMEFRAMES)}{RESET}\n")
+    print(f"{GREEN}{BANNER}   v{C.VERSION} · {syms()} · EMA {C.EMA_FAST}/{C.EMA_SLOW}/{C.EMA_TREND} · "
+          f"{'/'.join(C.TIMEFRAMES)}{RESET}\n")
 
 
 def heartbeat(next_within: float):
@@ -74,8 +80,8 @@ def weekend_pause() -> bool:
     resume = now + timedelta(seconds=left)
     key = f"PAUSED:{resume:%Y-%m-%d}"                            # one notice per weekend
     if not state.seen(key):
-        notifier.deliver(state, notifier.card(f"⏸️ {C.SYMBOL} paused for the weekend",
-                                              f"Resumes {resume:%a %d %b %H:%M} IST", "INFO"))
+        notifier.deliver(state, notifier.info("⏸️ paused for the weekend", f"Resumes {resume:%a %d %b %H:%M} IST",
+                                              symbol=syms(), channel="updates", kind="PAUSE"))
         state.mark(key)
     mt5.shutdown()
     nap = min(left, 600)                                         # short naps so the heartbeat stays fresh
@@ -103,8 +109,11 @@ def ensure_mt5() -> str | None:
         log.warning("MT5 health: %s — reconnecting", problem)
     mt5.shutdown()
     if mt5.initialize():
-        mt5.symbol_select(C.SYMBOL, True)
+        for sym in C.enabled_symbols():                            # disabled symbols are never touched
+            mt5.symbol_select(C.broker_symbol(sym), True)
         signals.sync_server_offset()
+        acc = mt5.account_info()
+        store.context["account_login"] = getattr(acc, "login", None)
         log.info("MT5 connected (server time %s)", signals.offset_text())
         return signals.health()
     err = f"MT5 init failed: {mt5.last_error()}"
@@ -124,33 +133,51 @@ def report_blind(problem: str):
     if not _blind["notified"] and now - _blind["since"] >= limit:
         _blind["notified"] = True
         mins = (now - _blind["since"]) / 60
-        notifier.deliver(state, notifier.warn(f"{C.SYMBOL} bot is BLIND — no alerts until this clears",
-                                              f"{problem}\nSince {mins:.0f} min. Check the MT5 terminal / internet.", ping=True))
+        notifier.deliver(state, notifier.warn("bot is BLIND — no alerts until this clears",
+                                              f"{problem}\nSince {mins:.0f} min. Check the MT5 terminal / internet.",
+                                              ping=True, symbol=syms(), kind="BLIND"))
 
 
 def report_recovered():
     if _blind["notified"]:
         mins = (time.time() - _blind["since"]) / 60
-        notifier.deliver(state, notifier.card(f"✅ {C.SYMBOL} feed is back", f"Was blind {mins:.0f} min — missed candles are being replayed.", "INFO"))
+        notifier.deliver(state, notifier.info("✅ feed is back", f"Was blind {mins:.0f} min — missed candles are being replayed.",
+                                              symbol=syms(), kind="RECOVERED"))
     _blind["since"], _blind["notified"] = None, False
 
 
-def _status_now(tf: str) -> str:
-    df = signals.fetch(tf)
-    price = signals.live_price()
+def _status_now(tf: str, symbol: str | None = None) -> str:
+    df = signals.fetch(tf, symbol=symbol)
+    price = signals.live_price(symbol)
     return signals.ema_status(df, price) if df is not None and price else "EMA status unavailable"
+
+
+def _status_fields(tf: str) -> list:
+    return [(sym, _status_now(tf, sym), False) for sym in C.enabled_symbols()]
 
 
 def announce_start():
     """One 'online' card per (re)start, rate-limited so a crash loop cannot flood."""
     today = f"ALIVE:{signals.utc_now().astimezone(TZ):%Y-%m-%d}"
+    store.record("system", {"event": "start", "detail": f"v{C.VERSION}", "sha": _git_sha()})
     if time.time() - state.d.get("last_start_notice", 0) >= C.START_NOTICE_COOLDOWN:
         state.d["last_start_notice"] = time.time(); state.save()
-        notifier.deliver(state, notifier.card(f"▶️ {C.SYMBOL} bot online", color="INFO",
-                                              fields=[("Now", _status_now(C.TIMEFRAMES[0]), False),
-                                                      ("Server clock", signals.offset_text())]))
+        off = [s for s in C.SYMBOLS if not C.is_enabled(s)]
+        notifier.deliver(state, notifier.info(f"▶️ bot online · v{C.VERSION}", symbol=syms(), channel="updates", kind="START",
+                                              fields=_status_fields(C.TIMEFRAMES[0]) +
+                                              [("Server clock", signals.offset_text())] +
+                                              ([("Disabled in config", ", ".join(off))] if off else [])))
     if not state.seen(today):
         state.mark(today)
+
+
+def _git_sha() -> str | None:
+    try:
+        import subprocess
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=C.PROJECT_DIR, capture_output=True,
+                              text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
 
 
 def alive_ping():
@@ -159,8 +186,8 @@ def alive_ping():
     now = signals.utc_now().astimezone(TZ)
     key = f"ALIVE:{now:%Y-%m-%d}"
     if f"{now:%H:%M}" >= C.ALIVE_PING_IST and not state.seen(key):
-        notifier.deliver(state, notifier.card(f"✅ {C.SYMBOL} bot alive", color="INFO",
-                                              fields=[("Now", _status_now(C.TIMEFRAMES[0]), False)]))
+        notifier.deliver(state, notifier.info(f"✅ bot alive · v{C.VERSION}", symbol=syms(), channel="updates",
+                                              kind="ALIVE", fields=_status_fields(C.TIMEFRAMES[0])))
         state.mark(key)
 
 
@@ -176,14 +203,18 @@ def next_sleep() -> float:
     return max(1.0, min(waits))
 
 
-def check_ema(tf: str):
-    last_done = state.d["last_bar"].get(tf)
+def check_ema(tf: str, symbol: str | None = None):
+    """New closed candles on one symbol: detect, deliver once, then move that symbol's checkpoint."""
+    symbol = symbol or C.SYMBOL
+    if not C.is_enabled(symbol):
+        return                                                     # disabled: no data reads, no alerts
+    last_done = state.last_bar(tf, symbol)
     since = pd.Timestamp(last_done).to_pydatetime() if last_done else None
     if since and signals.server_now() < since + timedelta(minutes=2 * C.BAR_MINUTES[tf]):
         return                                                     # the next candle has not closed yet
-    df = signals.fetch(tf, since=since)
+    df = signals.fetch(tf, since=since, symbol=symbol)
     if df is None:
-        log.warning("%s: no data", tf); return
+        log.warning("%s %s: no data", symbol, tf); return
     newest = df["time"].iloc[-1]
     if since and since >= newest.to_pydatetime():
         return                                                     # nothing new since checkpoint
@@ -195,74 +226,154 @@ def check_ema(tf: str):
     if since:
         clamped = df.attrs.get("clamped_from")
         if clamped:                                                # we chose not to fetch that far back
-            notifier.deliver(state, notifier.warn(f"{C.SYMBOL} {tf}: outage longer than replay limit",
-                                                  f"NOT replayed: {signals.fmt_times(clamped)} → {signals.fmt_times(first_eval)}\nReplaying from there."))
+            notifier.deliver(state, notifier.warn(f"{tf}: outage longer than replay limit",
+                                                  f"NOT replayed: {signals.fmt_times(clamped)} → {signals.fmt_times(first_eval)}\nReplaying from there.",
+                                                  symbol=symbol))
         elif first_eval > since + timedelta(minutes=C.BAR_MINUTES[tf]):   # broker history too short
-            notifier.deliver(state, notifier.warn(f"{C.SYMBOL} {tf}: MT5 history too short",
-                                                  f"NOT replayed: {signals.fmt_times(since)} → {signals.fmt_times(first_eval)}\nRaise 'Max bars in chart' in MT5."))
+            notifier.deliver(state, notifier.warn(f"{tf}: MT5 history too short",
+                                                  f"NOT replayed: {signals.fmt_times(since)} → {signals.fmt_times(first_eval)}\nRaise 'Max bars in chart' in MT5.",
+                                                  symbol=symbol))
 
     # ---- pass 1: detect everything, nothing persisted yet ----
     bar_min, now_srv = C.BAR_MINUTES[tf], signals.server_now()
     live, missed, missed_bars = [], [], 0                        # (key, bar_time, event)
     seen_now = set()                                               # episode-keyed events: once per replay too
-    for back in range(todo - 1, -1, -1):                           # oldest -> newest
-        sub = df.iloc[:len(df) - back]
-        bar_time = sub["time"].iloc[-1]
+    eval_from = df["time"].iloc[len(df) - todo]
+    for bar_time, e in candle_events(df, todo, tf, symbol):
         bar_close = bar_time.to_pydatetime() + timedelta(minutes=bar_min)
         is_missed = (now_srv - bar_close).total_seconds() > C.MISSED_GRACE_SECONDS
-        missed_bars += is_missed
-        for e in signals.detect(sub):
-            key = f"{C.SYMBOL}:{tf}:{e['type']}:{e['dir']}:{e.get('episode', str(bar_time))}"
-            if state.seen(key) or key in seen_now:
-                continue
-            seen_now.add(key)
-            (missed if is_missed and todo > 2 else live).append((key, bar_time, e))
+        key = f"{symbol}:{tf}:{e['type']}:{e['dir']}:{e.get('episode', str(bar_time))}"
+        if state.seen(key) or key in seen_now:
+            continue
+        seen_now.add(key)
+        (missed if is_missed and todo > 2 else live).append((key, bar_time, e))
+    missed_bars = sum((now_srv - (t.to_pydatetime() + timedelta(minutes=bar_min))).total_seconds() > C.MISSED_GRACE_SECONDS
+                      for t in df["time"][df["time"] >= eval_from])
 
     # ---- pass 2: deliver (or durably queue) FIRST, then mark keys and advance checkpoint ----
     if missed:
         lines = [notifier.digest_line(tf, bt, e) for _, bt, e in missed]
         for key, bt, e in missed:
-            notifier._logfile(notifier.format_event(tf, bt, e, missed=True), key)
-        price = signals.live_price() or float(df["close"].iloc[-1])
+            notifier._logfile(notifier.format_event(tf, bt, e, missed=True, symbol=symbol), key)
+            record_event(symbol, tf, bt, e)
+        price = signals.live_price(symbol) or float(df["close"].iloc[-1])
         last_missed_bar = missed[-1][1]
         notifier.deliver(state, notifier.format_digest(tf, lines, df["time"].iloc[len(df) - todo], last_missed_bar,
-                                                       missed_bars, signals.ema_status(df, price)))
+                                                       missed_bars, signals.ema_status(df, price), symbol=symbol))
         for key, _, _ in missed:                                   # digest is sent or in the retry queue -> safe to mark
             state.mark(key)
     elif missed_bars and todo > 2:
-        log.info("%s: %d missed bars, no signals in them", tf, missed_bars)
+        log.info("%s %s: %d missed bars, no signals in them", symbol, tf, missed_bars)
 
     charts = {}                                                    # one picture per candle, shared by its events
     for key, bt, e in live:
         image = None
-        if C.CHART_ENABLED and e["type"] in C.PING_TYPES:
+        if C.CHART_ENABLED and e["type"] in notifier.PINGS:
             if bt not in charts:
-                charts[bt] = chart.render(df[df["time"] <= bt], tf, notifier.event_caption(tf, bt, e), signals.to_ist,
-                                          mark_last=e["dir"])
+                charts[bt] = chart.render(df[df["time"] <= bt], tf, notifier.event_caption(tf, bt, e, symbol),
+                                          signals.to_ist, mark_last=e["dir"] if e["dir"] in ("BULL", "BEAR") else None,
+                                          symbol=symbol)
             image = charts[bt]
-        notifier.deliver(state, notifier.format_event(tf, bt, e, missed=(todo <= 2 and bt != newest), image=image), key=key)
+        record_event(symbol, tf, bt, e)
+        notifier.deliver(state, format_live(tf, bt, e, symbol, missed=(todo <= 2 and bt != newest), image=image), key=key)
         state.mark(key)
-    state.checkpoint(tf, newest)
+    state.checkpoint(tf, newest, symbol)
+
+
+def candle_events(df, todo: int, tf: str, symbol: str):
+    """(bar_time, event) for every candle in the last `todo` closed candles, oldest first."""
+    for back in range(todo - 1, -1, -1):                           # oldest -> newest
+        sub = df.iloc[:len(df) - back]
+        bar_time = sub["time"].iloc[-1]
+        for e in signals.detect(sub):
+            yield bar_time, e
+
+
+def format_live(tf, bt, e, symbol, missed=False, image=None):
+    return notifier.format_event(tf, bt, e, missed=missed, image=image, symbol=symbol)
+
+
+def record_event(symbol, tf, bt, e):
+    store.record("event", {"tf": tf, "bar_time": str(bt), "label": e["type"], "side": e["dir"], "tag": e.get("tag"),
+                           "price": float(e["price"]), "gap": e.get("gap"), "atr": e.get("atr"),
+                           "pair": e.get("pair")}, symbol=symbol)
+
+
+def _symbol_arg(req: dict) -> tuple[str | None, str | None]:
+    """(symbol, None) or (None, refusal text). No symbol given = the primary symbol."""
+    sym = str(req.get("symbol") or C.SYMBOL).upper()
+    if sym not in C.SYMBOLS:
+        return None, f"unknown symbol {sym!r} (known: {', '.join(C.SYMBOLS)})"
+    if not C.is_enabled(sym):
+        return None, f"{sym} is disabled in config"
+    return sym, None
+
+
+def chart_reply(symbol: str) -> dict:
+    tf = C.TIMEFRAMES[0]
+    df, price = signals.fetch(tf, symbol=symbol), signals.live_price(symbol)
+    if df is None or price is None:
+        return {"ok": False, "text": f"{symbol}: no market data right now."}
+    title = f"{symbol} {tf} · now {price:.2f} · {signals.to_ist(signals.server_now()):%d %b %H:%M} IST"
+    return {"ok": True, "text": f"**{symbol}** · {signals.ema_status(df, price)}",
+            "image": chart.render(df, tf, title, signals.to_ist, price_line=price, symbol=symbol)}
+
+
+STATUS_LINES: list = []                                            # callables symbol -> str, appended by features
+
+
+def status_reply(symbol: str) -> dict:
+    """/status: the /chart output plus version and the state lines features add (labels, monitor)."""
+    r = chart_reply(symbol)
+    extra = [f"v{C.VERSION} · server clock {signals.offset_text()}"] + [f(symbol) for f in STATUS_LINES]
+    r["text"] = r["text"] + "\n" + "\n".join(x for x in extra if x)
+    return r
+
+
+JSON_COMMANDS: dict = {}                                           # name -> handler(req), registered by features
+PLACE_GATES: list = []                                             # callables req -> refusal text or None
 
 
 def handle_json_command(req: dict) -> dict:
-    """chart / quote / place, sent by the Discord slash commands. Runs in the bot loop (the only MT5 thread)."""
+    """Commands from the Discord slash commands and buttons. Runs in the bot loop (the only MT5 thread)."""
+    reply = _handle_json_command(req)
+    store.record("command", {"name": req.get("cmd"), "arguments": {k: v for k, v in req.items()
+                                                                   if k not in ("cmd", "ts", "id", "user")},
+                             "user": req.get("user"), "outcome": "ok" if reply.get("ok") else "refused",
+                             "reply": str(reply.get("text", ""))[:300]},
+                 symbol=req.get("symbol"))
+    return reply
+
+
+def _handle_json_command(req: dict) -> dict:
     cmd = req.get("cmd")
     age = signals.utc_now().timestamp() - float(req.get("ts", 0))
     if age > C.COMMAND_MAX_AGE:
         return {"ok": False, "text": f"⌛ NOT done — the command was {age:.0f} s old when the bot saw it."}
-    if cmd == "chart":
-        tf = C.TIMEFRAMES[0]
-        df, price = signals.fetch(tf), signals.live_price()
-        if df is None or price is None:
-            return {"ok": False, "text": "No market data right now."}
-        title = f"{C.SYMBOL} {tf} · now {price:.2f} · {signals.to_ist(signals.server_now()):%d %b %H:%M} IST"
-        return {"ok": True, "text": signals.ema_status(df, price),
-                "image": chart.render(df, tf, title, signals.to_ist, price_line=price)}
+    if cmd in ("chart", "status"):
+        if cmd == "status" and not req.get("symbol"):           # one card per enabled symbol
+            cards = [status_reply(s) for s in C.enabled_symbols()]
+            return {"ok": all(c["ok"] for c in cards), "text": "\n\n".join(c["text"] for c in cards),
+                    "images": [c["image"] for c in cards if c.get("image")],
+                    "image": next((c["image"] for c in cards if c.get("image")), None)}
+        sym, why = _symbol_arg(req)
+        if why:
+            return {"ok": False, "text": why}
+        return chart_reply(sym) if cmd == "chart" else status_reply(sym)
+    if cmd in JSON_COMMANDS:
+        return JSON_COMMANDS[cmd](req)
     if cmd in ("quote", "place"):
         if req.get("user") not in C.DISCORD_ALLOWED_USER_IDS:      # checked again here, not only in Discord
             log.warning("order command from a user who is not allowed: %r", req.get("user"))
             return {"ok": False, "text": "⛔ NOT placed — this user is not in DISCORD_ALLOWED_USER_IDS."}
+        if req.get("symbol"):
+            sym, why = _symbol_arg(req)
+            if why:
+                return {"ok": False, "text": f"❌ NOT placed — {why}."}
+        for gate in PLACE_GATES:                                    # e.g. the Friday-close block (weekend.py)
+            why = gate(req)
+            if why:
+                return {"ok": False, "text": f"❌ NOT placed — {why}"}
     if cmd == "quote":
         return trader.preview(req)
     if cmd == "place":
@@ -273,7 +384,8 @@ def handle_json_command(req: dict) -> dict:
 
 
 def process_commands():
-    for reply in alerts.process_inbox(price=signals.live_price(), json_handler=handle_json_command):
+    for reply in alerts.process_inbox(json_handler=handle_json_command,
+                                      price_of=lambda sym: signals.live_price(sym)):
         log.info("command -> %s", reply[:200].replace("\n", " | "))    # new alerts are armed at the current price
 
 
@@ -287,48 +399,65 @@ def nap(seconds: float):
         time.sleep(min(0.25, left))
 
 
-def check_price_alerts(tf: str):
+def check_price_alerts(tf: str, symbol: str | None = None):
+    """Price alerts on every enabled symbol (or just `symbol`)."""
+    for sym in ([symbol] if symbol else C.enabled_symbols()):
+        if C.is_enabled(sym):
+            _check_price_alerts(tf, sym)
+
+
+def _per_symbol(name: str) -> dict:
+    d = state.d.get(name)
+    if not isinstance(d, dict):
+        d = state.d[name] = {}
+    return d
+
+
+def _check_price_alerts(tf: str, symbol: str):
     now_srv = signals.server_now()
-    since = state.d.get("last_price_check")
+    since = state.d["last_price_check"].get(symbol)
     since_dt = pd.Timestamp(since).to_pydatetime() if since else None
-    rng = signals.price_range_since(since_dt)
+    rng = signals.price_range_since(since_dt, symbol)
     if rng is None:
         return
     last, gap = rng["last"], rng["gap"]
+    retries = _per_symbol("price_hist_retries")
     if gap:
-        tries = state.d.get("price_hist_retries", 0) + 1
+        tries = retries.get(symbol, 0) + 1
         if tries < C.PRICE_HISTORY_RETRIES:                      # keep the checkpoint, try again next loop
-            state.d["price_hist_retries"] = tries; state.save()
-            log.warning("price history incomplete (%s), retry %d/%d", gap, tries, C.PRICE_HISTORY_RETRIES)
+            retries[symbol] = tries; state.save()
+            log.warning("%s price history incomplete (%s), retry %d/%d", symbol, gap, tries, C.PRICE_HISTORY_RETRIES)
             return
-        if time.time() - state.d.get("price_gap_notice_ts", 0) > 3600:      # at most once an hour
-            state.d["price_gap_notice_ts"] = time.time()
-            notifier.deliver(state, notifier.warn(f"{C.SYMBOL} price alerts: coverage incomplete",
-                                                  f"{gap}\nA touch in that window may have been missed — check the chart."))
-    state.d["price_hist_retries"] = 0
+        notices = _per_symbol("price_gap_notice_ts")
+        if time.time() - notices.get(symbol, 0) > 3600:          # at most once an hour
+            notices[symbol] = time.time()
+            notifier.deliver(state, notifier.warn("price alerts: coverage incomplete",
+                                                  f"{gap}\nA touch in that window may have been missed — check the chart.",
+                                                  symbol=symbol))
+    retries[symbol] = 0
     offset_s = signals._server_offset.total_seconds()
     now_real = signals.utc_now().timestamp()
     fresh = {}                                                     # new alerts: exact tick range since creation
-    for a in alerts.pending():
+    for a in alerts.pending(symbol):
         created = a.get("created")
         if created and now_real - created < C.NEW_ALERT_TICK_SECONDS:
-            rng_ticks = signals.bid_range_since(signals.stamp_to_dt(created + offset_s))
+            rng_ticks = signals.bid_range_since(signals.stamp_to_dt(created + offset_s), symbol)
             if rng_ticks:
                 fresh[a["level"]] = rng_ticks
-    triggered = alerts.check(last, m1=rng["m1"], server_offset_s=offset_s, tick_ranges=fresh)   # persists 'triggered' first ...
-    state.d["last_price_check"] = str(now_srv); state.save()           # ... THEN move the checkpoint
+    triggered = alerts.check(last, m1=rng["m1"], server_offset_s=offset_s, tick_ranges=fresh, symbol=symbol)
+    state.d["last_price_check"][symbol] = str(now_srv); state.save()   # ... THEN move the checkpoint
     if not triggered:
         return
-    df = signals.fetch(tf)
+    df = signals.fetch(tf, symbol=symbol)
     status = signals.ema_status(df, last) if df is not None else "EMA status unavailable"
     for t in triggered:
-        text = notifier.format_price_alert(t["level"], t["price"], status, signals.server_now())
+        text = notifier.format_price_alert(t["level"], t["price"], status, signals.server_now(), symbol=symbol)
         st = notifier.send(text)
         if any(v == "ok" for v in st.values()):
             owed = notifier.failed_services(st)
             if owed:
                 state.queue(text, owed)                            # the service that missed it gets a retry
-            alerts.ack(t["level"])
+            alerts.ack(t["level"], symbol)
         # all failed: do NOT queue — the 'triggered' record itself is the retry, so no duplicates
 
 
@@ -336,8 +465,8 @@ def check_time():
     """`python bot.py --check-time`: compare inferred broker offset with your terminal, then pin it in config."""
     if not mt5.initialize():
         sys.exit(f"MT5 init failed: {mt5.last_error()}")
-    mt5.symbol_select(C.SYMBOL, True)
-    tick = mt5.symbol_info_tick(C.SYMBOL)
+    mt5.symbol_select(C.broker_symbol(C.SYMBOL), True)
+    tick = mt5.symbol_info_tick(C.broker_symbol(C.SYMBOL))
     if tick is None:
         sys.exit(f"No tick for {C.SYMBOL}")
     signals.sync_server_offset()
@@ -345,7 +474,7 @@ def check_time():
     print("\nWatching the feed for ~40 s ...")
     for _ in range(8):                                             # let observe_clock measure from live ticks
         time.sleep(5)
-        tick = mt5.symbol_info_tick(C.SYMBOL) or tick
+        tick = mt5.symbol_info_tick(C.broker_symbol(C.SYMBOL)) or tick
         signals.observe_clock(tick)
     raw = signals.stamp_to_dt(tick.time)
     feed = (tick.time - signals.utc_now().timestamp()) / 3600
@@ -364,15 +493,19 @@ def main():
         check_time(); return
     print_banner()
     problems = C.validate()
+    if not problems and mt5.initialize():                          # symbols must exist and be in Market Watch
+        problems = C.validate(symbol_check=signals.symbol_problem)
+        mt5.shutdown()
     if problems:
         sys.exit("Config problems:\n  - " + "\n  - ".join(problems))
-    log.info("Starting %s EMA %d/%d/%d on %s | delivering to %s | replay up to %d bars",
-             C.SYMBOL, C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND, C.TIMEFRAMES, notifier.configured(), REPLAY_CAP)
+    log.info("Starting v%s %s EMA %d/%d/%d on %s | delivering to %s | replay up to %d bars",
+             C.VERSION, syms(), C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND, C.TIMEFRAMES, notifier.configured(), REPLAY_CAP)
     if state.problem:
         notifier.deliver(state, notifier.warn("State recovered", state.problem))
     log.info("Data folder: %s", C.DATA_DIR)
     chart.prune()
     if alerts.start_discord_listener():
+        notifier.BOT_CLIENT["on"] = True
         log.info("Discord commands starting: /chart /alert /alerts and /place (%s)", "ON" if C.PLACE_ENABLED else "off")
     backoff, announced, last_flush = 5, False, 0.0
     while True:
@@ -392,9 +525,10 @@ def main():
             report_recovered()
             note = signals.pop_clock_note()
             if note:
-                notifier.deliver(state, notifier.warn(f"{C.SYMBOL} MT5 clock corrected", note))
-            for tf in C.TIMEFRAMES:                                # signals first: nothing may delay a fresh candle
-                check_ema(tf)
+                notifier.deliver(state, notifier.warn("MT5 clock corrected", note, symbol=syms()))
+            for sym in C.enabled_symbols():                        # signals first: nothing may delay a fresh candle
+                for tf in C.TIMEFRAMES:
+                    check_ema(tf, sym)
             process_commands()
             check_price_alerts(C.TIMEFRAMES[0])
             if not announced:

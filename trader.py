@@ -68,10 +68,16 @@ def _build(req: dict) -> tuple[dict | None, dict]:
         return None, _fail("lot, sl and tp are all required numbers.")
     if lot <= 0 or sl_in <= 0 or tp_in <= 0:
         return None, _fail("lot, sl and tp must be greater than zero (stop-loss and take-profit are mandatory).")
+    name = str(req.get("symbol") or C.SYMBOL).upper()
+    if name not in C.SYMBOLS:
+        return None, _fail(f"unknown symbol {name}.")
+    if not C.is_enabled(name):
+        return None, _fail(f"{name} is disabled in config.")
+    SYM = C.broker_symbol(name)
 
     # ---- terminal and account ----
     term, acc = mt5.terminal_info(), mt5.account_info()
-    info, tick = mt5.symbol_info(C.SYMBOL), mt5.symbol_info_tick(C.SYMBOL)
+    info, tick = mt5.symbol_info(SYM), mt5.symbol_info_tick(SYM)
     if term is None or acc is None or info is None or tick is None:
         return None, _fail("MT5 is not connected.")
     if not getattr(term, "trade_allowed", True):
@@ -117,19 +123,19 @@ def _build(req: dict) -> tuple[dict | None, dict]:
 
     # ---- money: what this order can lose, win and lock up ----
     otype = mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL
-    loss = mt5.order_calc_profit(otype, C.SYMBOL, lot, price, sl)
-    gain = mt5.order_calc_profit(otype, C.SYMBOL, lot, price, tp)
-    margin = mt5.order_calc_margin(otype, C.SYMBOL, lot, price)
+    loss = mt5.order_calc_profit(otype, SYM, lot, price, sl)
+    gain = mt5.order_calc_profit(otype, SYM, lot, price, tp)
+    margin = mt5.order_calc_margin(otype, SYM, lot, price)
     if loss is None or gain is None:
         return None, _fail("MT5 could not calculate the risk of this order.")
     if C.PLACE_MAX_RISK is not None and -loss > C.PLACE_MAX_RISK:
         return None, _fail(f"loss at the stop would be {-loss:,.2f} {acc.currency}, above your PLACE_MAX_RISK {C.PLACE_MAX_RISK:,.2f}.")
     if C.PLACE_MAX_POSITIONS is not None:
-        open_now = mt5.positions_get(symbol=C.SYMBOL)
+        open_now = mt5.positions_get(symbol=SYM)
         if open_now is None:
             return None, _fail("MT5 could not list open positions (needed for PLACE_MAX_POSITIONS).")
         if len(open_now) >= C.PLACE_MAX_POSITIONS:
-            return None, _fail(f"{len(open_now)} position(s) already open on {C.SYMBOL}; PLACE_MAX_POSITIONS is {C.PLACE_MAX_POSITIONS:g}.")
+            return None, _fail(f"{len(open_now)} position(s) already open on {name}; PLACE_MAX_POSITIONS is {C.PLACE_MAX_POSITIONS:g}.")
     if C.PLACE_DAILY_LOSS_LIMIT is not None:
         pnl = _closed_pnl_today()
         if pnl is None:
@@ -137,10 +143,10 @@ def _build(req: dict) -> tuple[dict | None, dict]:
         if -pnl >= C.PLACE_DAILY_LOSS_LIMIT:
             return None, _fail(f"today's closed loss is {-pnl:,.2f} {acc.currency}; PLACE_DAILY_LOSS_LIMIT is {C.PLACE_DAILY_LOSS_LIMIT:,.2f}.")
 
-    order = {"action": mt5.TRADE_ACTION_DEAL, "symbol": C.SYMBOL, "volume": lot, "type": otype, "price": price,
+    order = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYM, "volume": lot, "type": otype, "price": price,
              "sl": sl, "tp": tp, "deviation": C.PLACE_DEVIATION_POINTS, "magic": C.PLACE_MAGIC,
              "comment": "aureon /place", "type_time": mt5.ORDER_TIME_GTC}
-    return order, {"info": info, "acc": acc, "buy": buy, "filling": filling, "digits": digits,
+    return order, {"info": info, "acc": acc, "buy": buy, "filling": filling, "digits": digits, "name": name,
                    "loss": loss, "gain": gain, "margin": margin}
 
 
@@ -155,14 +161,14 @@ def preview(req: dict) -> dict:
     order, ctx = _build(req)
     if order is None:
         return ctx
-    return {"ok": True, "text": f"{'BUY' if ctx['buy'] else 'SELL'} {order['volume']:g} {C.SYMBOL} @ ~{order['price']:.{ctx['digits']}f}\n"
+    return {"ok": True, "text": f"{'BUY' if ctx['buy'] else 'SELL'} {order['volume']:g} {ctx['name']} @ ~{order['price']:.{ctx['digits']}f}\n"
                                 + _levels_text(order, ctx)}
 
 
-def _find_position(ticket):
-    """The position this order opened, read back from MT5 (a few quick tries), or None."""
+def _find_position(ticket, symbol: str | None = None):
+    """The position this order opened, read back from MT5 (a few quick tries), or None. symbol = broker name."""
     for _ in range(5):
-        found = mt5.positions_get(symbol=C.SYMBOL) or ()
+        found = mt5.positions_get(symbol=symbol or C.broker_symbol(C.SYMBOL)) or ()
         for p in found:
             if ticket in (getattr(p, "ticket", None), getattr(p, "identifier", None)):
                 return p
@@ -172,7 +178,7 @@ def _find_position(ticket):
 
 def _protect(pos, order: dict) -> bool:
     """Some brokers open market orders without the SL/TP that was sent. Put them on the position now."""
-    res = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "symbol": C.SYMBOL, "position": pos.ticket,
+    res = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "symbol": order["symbol"], "position": pos.ticket,
                           "sl": order["sl"], "tp": order["tp"]})
     _journal({"action": "SLTP", "position": pos.ticket, "sl": order["sl"], "tp": order["tp"]}, res, "-")
     return res is not None and res.retcode in (PLACED, DONE)
@@ -182,10 +188,10 @@ def _report(res, order: dict, ctx: dict, filling: str) -> dict:
     """Say what MT5 actually holds after the broker accepted the order - not what we hoped for."""
     d, side = ctx["digits"], "BUY" if ctx["buy"] else "SELL"
     acct = _account_text(ctx["acc"])
-    pos = _find_position(res.order)
+    pos = _find_position(res.order, order["symbol"])
     if pos is None:
         if res.retcode == PLACED:
-            return {"ok": True, "text": f"⏳ ACCEPTED, not filled yet · order {res.order}\n{side} {order['volume']:g} {C.SYMBOL}\n"
+            return {"ok": True, "text": f"⏳ ACCEPTED, not filled yet · order {res.order}\n{side} {order['volume']:g} {ctx['name']}\n"
                                         f"The broker took the order but no position shows yet — CHECK MT5.\n{acct}"}
         return {"ok": True, "text": f"⚠️ Broker answered 'done' (order {res.order}) but no position is visible — CHECK MT5 "
                                     f"before placing again.\n{acct}"}
@@ -194,10 +200,10 @@ def _report(res, order: dict, ctx: dict, filling: str) -> dict:
         lines.append(f"⚠️ PARTLY FILLED · {pos.volume:g} of {order['volume']:g} lot · position {pos.ticket}")
     else:
         lines.append(f"✅ FILLED · position {pos.ticket}")
-    lines.append(f"{side} {pos.volume:g} {C.SYMBOL} @ {pos.price_open:.{d}f} · {filling.upper()}")
+    lines.append(f"{side} {pos.volume:g} {ctx['name']} @ {pos.price_open:.{d}f} · {filling.upper()}")
     protected = abs(pos.sl - order["sl"]) < 10 ** -d and abs(pos.tp - order["tp"]) < 10 ** -d
     if not protected and _protect(pos, order):
-        pos = _find_position(res.order) or pos
+        pos = _find_position(res.order, order["symbol"]) or pos
         protected = abs(pos.sl - order["sl"]) < 10 ** -d and abs(pos.tp - order["tp"]) < 10 ** -d
     if protected:
         lines.append(f"SL {pos.sl:.{d}f} · TP {pos.tp:.{d}f} — both set on the position")
@@ -251,5 +257,9 @@ def _journal(order: dict, res, filling: str):
         with open(os.path.join(C.TRADE_LOG_DIR, f"trades-{time.strftime('%Y-%m')}.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=str) + "\n")
         log.info("ORDER %s", row)
+        import store
+        store.record("order", {"request": row["request"], "result": row["comment"], "retcode": row["retcode"],
+                               "ticket": row["ticket"], "price": row["price"]},
+                     symbol=C.logical_symbol(order.get("symbol")) or order.get("symbol"))
     except Exception:
         log.exception("trade journal write failed")

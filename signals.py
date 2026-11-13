@@ -111,17 +111,34 @@ def fmt_times(server_dt: datetime) -> str:
     return f"IST {to_ist(server_dt):%d %b %H:%M} | MT5 server {server_dt:%d %b %H:%M}"
 
 
+def _b(symbol: str | None) -> str:
+    """Broker name of a logical symbol (None = the primary symbol)."""
+    return C.broker_symbol(symbol or C.SYMBOL)
+
+
+def symbol_problem(broker_name: str) -> str | None:
+    """None if the broker symbol exists and is in Market Watch (it is selected if it exists but is hidden)."""
+    info = mt5.symbol_info(broker_name)
+    if info is None:
+        return "does not exist at this broker"
+    if not info.visible and not mt5.symbol_select(broker_name, True):
+        return "is not visible in Market Watch"
+    return None
+
+
 def health() -> str | None:
-    """None if healthy, else a reason. Checks terminal, symbol and tick freshness."""
+    """None if healthy, else a reason. Checks terminal, every ENABLED symbol, and tick freshness (primary symbol;
+    the clock is the broker's, shared by all symbols). Disabled symbols are never touched."""
     ti = mt5.terminal_info()
     if ti is None:
         return "terminal not connected"
     if not getattr(ti, "connected", True):
         return "MT5 terminal has no connection to the broker"
-    info = mt5.symbol_info(C.SYMBOL)
-    if info is None or not info.visible:
-        return f"symbol {C.SYMBOL} not available"
-    tick = mt5.symbol_info_tick(C.SYMBOL)
+    for sym in C.enabled_symbols():
+        info = mt5.symbol_info(_b(sym))
+        if info is None or not info.visible:
+            return f"symbol {sym} not available"
+    tick = mt5.symbol_info_tick(_b(C.SYMBOL))
     if tick is None:
         return "no tick"
     observe_clock(tick)
@@ -131,22 +148,22 @@ def health() -> str | None:
     return f"stale tick ({age:.0f}s)" if age > 600 else None
 
 
-def live_price() -> float | None:
-    tick = mt5.symbol_info_tick(C.SYMBOL)
+def live_price(symbol: str | None = None) -> float | None:
+    tick = mt5.symbol_info_tick(_b(symbol))
     return tick.bid if tick else None
 
 
-def price_range_since(since_server: datetime | None) -> dict | None:
+def price_range_since(since_server: datetime | None, symbol: str | None = None) -> dict | None:
     """M1 lows/highs from `since_server` (server time) to now, plus live bid.
     Returns {"low","high","last","gap"} where gap is None if coverage is complete, else a text describing
     the uncovered period. Returns None only if there is no tick at all."""
-    tick = mt5.symbol_info_tick(C.SYMBOL)
+    tick = mt5.symbol_info_tick(_b(symbol))
     if tick is None:
         return None
     now = server_now()
     lo = hi = tick.bid
     want = since_server or (now - timedelta(minutes=2))
-    rates = mt5.copy_rates_range(C.SYMBOL, TF["M1"], _mt5_dt(want - timedelta(minutes=1)), _mt5_dt(now + timedelta(hours=1)))
+    rates = mt5.copy_rates_range(_b(symbol), TF["M1"], _mt5_dt(want - timedelta(minutes=1)), _mt5_dt(now + timedelta(hours=1)))
     gap = None
     if rates is None or len(rates) == 0:
         if (now - want) > timedelta(minutes=3):
@@ -165,11 +182,11 @@ def price_range_since(since_server: datetime | None) -> dict | None:
     return {"low": lo, "high": hi, "last": tick.bid, "gap": gap, "m1": m1}
 
 
-def bid_range_since(since_server: datetime) -> tuple[float, float] | None:
+def bid_range_since(since_server: datetime, symbol: str | None = None) -> tuple[float, float] | None:
     """Exact (low, high) of the bid from ticks since `since_server`, or None if ticks are unavailable.
     Used for the first minutes of a new price alert, where an M1 bar would also contain older prices."""
     try:
-        ticks = mt5.copy_ticks_range(C.SYMBOL, _mt5_dt(since_server), _mt5_dt(server_now() + timedelta(hours=1)),
+        ticks = mt5.copy_ticks_range(_b(symbol), _mt5_dt(since_server), _mt5_dt(server_now() + timedelta(hours=1)),
                                      mt5.COPY_TICKS_ALL)
     except Exception:
         return None
@@ -179,13 +196,13 @@ def bid_range_since(since_server: datetime) -> tuple[float, float] | None:
     return (float(bids.min()), float(bids.max())) if len(bids) else None
 
 
-def fetch(tf: str, since: datetime | None = None) -> pd.DataFrame | None:
+def fetch(tf: str, since: datetime | None = None, symbol: str | None = None) -> pd.DataFrame | None:
     """Closed bars. Without `since`: last BARS bars. With `since` (checkpoint, server time): from
     since - WARMUP_BARS to now, so the whole outage is covered with a stable EMA200 at its start."""
     bar_min = C.BAR_MINUTES[tf]
     clamped_from = None
     if since is None:
-        rates = mt5.copy_rates_from_pos(C.SYMBOL, TF[tf], 1, C.BARS)        # start_pos=1 -> closed only
+        rates = mt5.copy_rates_from_pos(_b(symbol), TF[tf], 1, C.BARS)        # start_pos=1 -> closed only
     else:
         now = server_now()
         floor = now - timedelta(minutes=bar_min * C.MAX_REPLAY_BARS)
@@ -193,8 +210,8 @@ def fetch(tf: str, since: datetime | None = None) -> pd.DataFrame | None:
         if since < floor:                                               # outage longer than the sanity cap
             clamped_from, rng_start = since, floor
         # warm-up by BAR COUNT (weekend gaps don't matter), then everything after the checkpoint by range
-        before = mt5.copy_rates_from(C.SYMBOL, TF[tf], _mt5_dt(rng_start), C.WARMUP_BARS)
-        after = mt5.copy_rates_range(C.SYMBOL, TF[tf], _mt5_dt(rng_start), _mt5_dt(now + timedelta(hours=1)))
+        before = mt5.copy_rates_from(_b(symbol), TF[tf], _mt5_dt(rng_start), C.WARMUP_BARS)
+        after = mt5.copy_rates_range(_b(symbol), TF[tf], _mt5_dt(rng_start), _mt5_dt(now + timedelta(hours=1)))
         parts = [r for r in (before, after) if r is not None and len(r)]
         rates = None
         if parts:
@@ -209,6 +226,7 @@ def fetch(tf: str, since: datetime | None = None) -> pd.DataFrame | None:
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")               # naive = MT5 server time
     df.attrs["clamped_from"] = clamped_from
+    df.attrs["symbol"] = symbol or C.SYMBOL
     for p in (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND):
         df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
     tr = pd.concat([df["high"] - df["low"],
@@ -316,25 +334,5 @@ def detect(df: pd.DataFrame) -> list[dict]:
             events.append({"type": "NARROW_ZONE_END", "dir": d_end, "price": now["close"],
                            "bars": len(seg) - start, "zone_hi": z_hi, "zone_lo": z_lo, "ema_dir": ema_dir})
 
-    # Pre-cross: gap shrinking PRE_CROSS_BARS bars in a row and tight. Once per episode (dedupe by episode key).
-    thr = C.PRE_CROSS_ATR_FRAC * df["atr"]
-    pre_cond = (gap_all <= thr)
-    for k in range(1, C.PRE_CROSS_BARS + 1):
-        pre_cond &= gap_all < gap_all.shift(k)
-    pre_cond = pre_cond.fillna(False)
-    if not d and pre_cond.iloc[-1]:
-        events.append({"type": "PRE_CROSS", "dir": "BULL" if now[F] < now[S] else "BEAR",
-                       "price": now["close"], "episode": last_8_32_cross_time(df)})
-
-    # Pre-cross invalidated: a pre-cross condition fired earlier in THIS episode, no cross happened,
-    # and the gap has now widened 2 bars in a row to > 2x the pre-cross threshold. Once per episode.
-    if not d:
-        ep_start = pd.Timestamp(last_8_32_cross_time(df))
-        in_ep = df["time"] > ep_start
-        had_pre = bool(pre_cond[in_ep].iloc[:-1].any())
-        widening = gap_all.iloc[-1] > gap_all.iloc[-2] > gap_all.iloc[-3] and gap_all.iloc[-1] > 2 * thr.iloc[-1]
-        if had_pre and widening and not pre_cond.iloc[-1]:
-            events.append({"type": "PRE_CROSS_FAILED", "dir": "BULL" if now[F] > now[S] else "BEAR",
-                           "price": now["close"], "episode": last_8_32_cross_time(df),
-                           "gap": float(gap_all.iloc[-1])})
+    # Pre-cross moved to labels.py (three pairs, armed / fires / failed, spec 5.4).
     return events

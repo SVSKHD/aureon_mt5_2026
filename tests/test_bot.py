@@ -114,12 +114,12 @@ class Signals(Base):
 
     def test_forming_candle_is_never_used(self):
         bot.check_ema("M30")
-        cp = bot.state.d["last_bar"]["M30"]
+        cp = bot.state.d["last_bar"]["XAUUSD:M30"]
         World.advance(seconds=5)                                      # 10:29:55, candle still open
         with mock.patch.object(signals, "fetch", wraps=signals.fetch) as f:
             bot.check_ema("M30")
             self.assertEqual(f.call_count, 0)                         # no history pull between closes
-        self.assertEqual(bot.state.d["last_bar"]["M30"], cp)
+        self.assertEqual(bot.state.d["last_bar"]["XAUUSD:M30"], cp)
         df = signals.fetch("M30", since=datetime.fromisoformat(cp))
         forming_open = int(World.stamp()) // 1800 * 1800
         self.assertLess(df["time"].iloc[-1].timestamp(), forming_open)
@@ -138,13 +138,13 @@ class Signals(Base):
         d = titles(Http.to("discord"))
         self.assertEqual(len(d), 1); self.assertIn("MISSED WHILE OFFLINE", d[0])
         newest_closed = int(World.stamp()) // 1800 * 1800 - 1800
-        self.assertEqual(datetime.fromisoformat(bot.state.d["last_bar"]["M30"]).replace(tzinfo=timezone.utc).timestamp(), newest_closed)
+        self.assertEqual(datetime.fromisoformat(bot.state.d["last_bar"]["XAUUSD:M30"]).replace(tzinfo=timezone.utc).timestamp(), newest_closed)
         n = len(Http.sent); bot.check_ema("M30"); self.assertEqual(len(Http.sent), n)
 
     def test_ema200_matches_full_history(self):
         import pandas as pd
         bot.check_ema("M30")
-        df = signals.fetch("M30", since=datetime.fromisoformat(bot.state.d["last_bar"]["M30"]))
+        df = signals.fetch("M30", since=datetime.fromisoformat(bot.state.d["last_bar"]["XAUUSD:M30"]))
         full = fake_mt5._bars("M30")[:-1]
         ref = pd.Series(full["close"]).ewm(span=200, adjust=False).mean().iloc[-1]
         self.assertAlmostEqual(df["ema200"].iloc[-1], ref, delta=0.01)
@@ -191,7 +191,7 @@ class Clock(Base):
         self.assertIn("UTC+0", signals.pop_clock_note())
         bot.check_ema("M30")                                          # and candles are read up to the real newest one
         newest_closed = int(World.stamp()) // 1800 * 1800 - 1800
-        self.assertEqual(datetime.fromisoformat(bot.state.d["last_bar"]["M30"]).replace(tzinfo=timezone.utc).timestamp(), newest_closed)
+        self.assertEqual(datetime.fromisoformat(bot.state.d["last_bar"]["XAUUSD:M30"]).replace(tzinfo=timezone.utc).timestamp(), newest_closed)
 
     def test_broker_on_other_offset_is_detected(self):
         World.stamp_offset = timedelta(hours=3)                       # e.g. different DST dates than config
@@ -521,7 +521,7 @@ class Config(Base):
             self.skipTest("discord.py not installed")
         tree = alerts.build_discord_client().tree
         cmds = {c.name: c for c in tree.get_commands()}
-        self.assertEqual(set(cmds), {"chart", "place", "alert", "alert_remove", "alerts"})
+        self.assertEqual(set(cmds), {"chart", "status", "place", "alert", "alert_remove", "alerts"})
         params = {p.name: p for p in cmds["place"].parameters}
         self.assertEqual([c.value for c in params["side"].choices], ["buy", "sell"])
         self.assertEqual([c.value for c in params["filling"].choices], ["auto", "fok", "ioc", "return"])
