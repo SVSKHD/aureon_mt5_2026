@@ -270,7 +270,21 @@ EXTRA_COMMANDS: list = [           # (name, description): simple [symbol] comman
     ("positions", "Open positions, stops, next trailing step, account totals"),
     ("monitor", "Live monitor card for a symbol (stays on until /unmonitor)"),
     ("unmonitor", "Stop the live monitor card"),
+    ("last-week", "Last completed Mon-Fri: crosses, 200 crosses, positions, P&L, week chart"),
 ]
+
+
+def chunks(text: str, size: int = 1990) -> list[str]:
+    """Split a long reply on line breaks so each piece fits one Discord message."""
+    out, cur = [], ""
+    for line in str(text).split("\n"):
+        while len(line) > size:
+            out.append(line[:size]); line = line[size:]
+        if len(cur) + len(line) + 1 > size:
+            out.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    return out + ([cur] if cur else []) or [""]
 
 
 def build_discord_client():
@@ -299,13 +313,16 @@ def build_discord_client():
 
     SYMBOL_CHOICES = [app_commands.Choice(name=s + ("" if C.is_enabled(s) else " (disabled)"), value=s) for s in C.SYMBOLS]
 
-    async def answer(inter, reply):
-        text = str(reply.get("text", "no reply"))[:1990]
-        files = files_of(reply)
-        if files:
-            await inter.followup.send(text, files=files)
-        else:
-            await inter.followup.send(text)
+    async def answer(inter, reply, view=None):
+        parts, files = chunks(reply.get("text", "no reply")), files_of(reply)
+        for k, part in enumerate(parts):
+            kw = {}
+            if k == len(parts) - 1:                               # pictures and buttons on the last piece
+                if files:
+                    kw["files"] = files
+                if view:
+                    kw["view"] = view
+            await inter.followup.send(part, **kw)
 
     async def allowed(inter, trade=False) -> bool:
         ok = (can_trade if trade else authorised)(inter.user.id, inter.channel_id)
@@ -338,13 +355,7 @@ def build_discord_client():
                 await inter.response.defer()
                 reply = await ask(cmd_name.replace("-", "_"), {"symbol": symbol.value if symbol else None,
                                                                "user": inter.user.id}, wait_s=30.0)
-                view = button_view(reply.get("buttons"))
-                text = str(reply.get("text", "no reply"))[:1990]
-                files = files_of(reply)
-                kw = {"files": files} if files else {}
-                if view:
-                    kw["view"] = view
-                await inter.followup.send(text, **kw)
+                await answer(inter, reply, button_view(reply.get("buttons")))
             return simple
         tree.command(name=name, description=desc)(make(name))
 

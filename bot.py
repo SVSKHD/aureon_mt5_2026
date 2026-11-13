@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend
+import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -472,6 +472,8 @@ JSON_COMMANDS: dict = {                                            # name -> han
     "close": _close_cmd,
     "monitor": lambda req: _with_symbol(req, lambda s: monitor.start(state, s, req.get("user"))),
     "unmonitor": lambda req: _with_symbol(req, lambda s: monitor.stop(state, s)),
+    "last_week": lambda req: (_with_symbol(req, lambda s: report.last_week_reply([s])) if req.get("symbol")
+                              else report.last_week_reply(C.enabled_symbols())),
 }
 
 
