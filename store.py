@@ -1,7 +1,7 @@
 """Records for a future database (spec section 12). ONE interface: record(kind, payload).
 
 The default sink appends one JSON line per record to logs/records/<kind>-YYYY-MM.jsonl. RECORD_SINK = "none"
-turns it off. There is no database driver, connection string or schema here, and nothing in the bot ever reads
+turns it off; "api" writes the same JSONL files and uploader.py ships them to the Assembler API. There is no database driver, connection string or schema here, and nothing in the bot ever reads
 these files back: live state stays in the state files. A later database sink only has to implement write(rows)
 and can replay the JSONL files to backfill.
 
@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import config as C
 
 log = logging.getLogger("store")
-KINDS = ("event", "alert", "position", "sl_change", "order", "command", "weekly", "system")
+KINDS = ("event", "alert", "position", "sl_change", "order", "command", "weekly", "system", "bar")
 context = {"account_login": None}          # set by the bot after it connects (this module never calls MT5)
 _q: queue.Queue = queue.Queue(maxsize=50000)
 _thread = None
