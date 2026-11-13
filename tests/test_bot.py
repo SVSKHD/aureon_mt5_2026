@@ -521,7 +521,7 @@ class Config(Base):
             self.skipTest("discord.py not installed")
         tree = alerts.build_discord_client().tree
         cmds = {c.name: c for c in tree.get_commands()}
-        self.assertEqual(set(cmds), {"chart", "status", "place", "alert", "alert_remove", "alerts", "positions"})
+        self.assertEqual(set(cmds), {"chart", "status", "place", "alert", "alert_remove", "alerts", "positions", "monitor", "unmonitor"})
         params = {p.name: p for p in cmds["place"].parameters}
         self.assertEqual([c.value for c in params["side"].choices], ["buy", "sell"])
         self.assertEqual([c.value for c in params["filling"].choices], ["auto", "fok", "ioc", "return"])

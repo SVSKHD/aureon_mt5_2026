@@ -413,7 +413,8 @@ def format_event(tf, bar_time, e, missed=False, image=None, symbol: str | None =
     """Live alert card. Title starts with the symbol. status = the present market status line."""
     symbol = symbol or C.SYMBOL
     ist, srv = _times(tf, bar_time)
-    title = f"{symbol} {_emoji(e)} {tf} · {TITLES.get(e['type'], e['type'])} {ARROW.get(e['dir'], e['dir'])}"
+    name = TITLES.get(e['type'], e['type']) + (f" {e['pair']}" if e.get("pair") else "")
+    title = f"{symbol} {_emoji(e)} {tf} · {name} {ARROW.get(e['dir'], e['dir'])}"
     if missed:
         title = f"{symbol} ⚠️ MISSED · " + title[len(symbol) + 1:]
     fields = [("Price", f"{e['price']:.2f}"), ("Candle closed", ist)]
@@ -437,7 +438,8 @@ def event_caption(tf, bar_time, e, symbol: str | None = None) -> str:
 
 def digest_line(tf, bar_time, e) -> str:
     close_time = bar_time.to_pydatetime() + timedelta(minutes=C.BAR_MINUTES[tf])
-    return (f"{_emoji(e)} `{signals.to_ist(close_time):%d %b %H:%M}` {TITLES.get(e['type'], e['type'])} "
+    return (f"{_emoji(e)} `{signals.to_ist(close_time):%d %b %H:%M}` {TITLES.get(e['type'], e['type'])}"
+            f"{' ' + e['pair'] if e.get('pair') else ''} "
             f"{ARROW.get(e['dir'], e['dir'])} @ **{e['price']:.2f}**")
 
 

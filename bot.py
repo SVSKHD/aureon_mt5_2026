@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store, labels, positions
+import signals, notifier, alerts, chart, trader, store, labels, positions, monitor
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -294,7 +294,8 @@ def check_ema(tf: str, symbol: str | None = None):
         hook(symbol, tf, df, lab, fresh)
 
 
-CANDLE_HOOKS: list = [lambda symbol, tf, df, lab, fresh: positions.on_candle(state, symbol, df, lab, fresh)]
+CANDLE_HOOKS: list = [lambda symbol, tf, df, lab, fresh: positions.on_candle(state, symbol, df, lab, fresh),
+                      lambda symbol, tf, df, lab, fresh: monitor.refresh(state, symbol, lab, df, candle_close=True)]
 
 
 def _fold_quiet(live):
@@ -318,7 +319,14 @@ def _fold_quiet(live):
 LABELS: dict = {}                                                  # symbol -> labels.Result for the newest closed bar
 LIVE_LABELS = {labels.GAP_WIDENING, labels.PARALLEL, labels.WIDE_GAP, labels.GAP_PEAKED, labels.PULLBACK,
                labels.RE_ENTRY, labels.PULLBACK_FAILED, labels.PRE_CROSS, labels.PRE_CROSS_FAILED}
-EVENT_HOOKS: list = [lambda symbol, tf, bt, e: positions.event_lines(state, symbol, e)]
+def _pre_cross_button(symbol, tf, bt, e):
+    """A pre-cross is a WATCH signal: its only button is Monitor (no Place, no entry, no SL)."""
+    if e["type"] == labels.PRE_CROSS:
+        return {"buttons": [notifier.button("Monitor", "monitor", symbol, style="primary")]}
+    return {}
+
+
+EVENT_HOOKS: list = [lambda symbol, tf, bt, e: positions.event_lines(state, symbol, e), _pre_cross_button]
 #                        callables (symbol, tf, bar_time, event) -> {"fields": [...], "buttons": [...]}
 
 
@@ -326,8 +334,21 @@ def update_labels(symbol: str, df) -> "labels.Result":
     """Re-run the label engine over every closed candle we hold. Pure and deterministic, so a restart rebuilds
     exactly the same label, pullback and TSL state."""
     res = labels.run(labels.prepare(df))
-    LABELS[symbol] = res
+    LABELS[symbol], LAST_DF[symbol] = res, df
     return res
+
+
+LAST_DF: dict = {}                                                 # symbol -> the candles LABELS was computed on
+
+
+def warm_start():
+    """After a (re)start: rebuild labels from candles, re-read positions, apply any pending trailing-stop step.
+    Nothing here sends a market order; the stop can only be tightened."""
+    for sym in C.enabled_symbols():
+        df = signals.fetch(C.TIMEFRAMES[0], symbol=sym)
+        if df is not None:
+            lab = update_labels(sym, df)
+            positions.on_candle(state, sym, df, lab, [])
 
 
 def _dir(side: int) -> str:
@@ -407,7 +428,8 @@ def chart_reply(symbol: str) -> dict:
             "image": chart.render(df, tf, title, signals.to_ist, price_line=price, symbol=symbol)}
 
 
-STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else ""]
+STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else "",
+                      lambda sym: monitor.status_line(state, sym)]
 
 
 def status_reply(symbol: str) -> dict:
@@ -448,7 +470,20 @@ JSON_COMMANDS: dict = {                                            # name -> han
     "keep": lambda req: positions.keep(state, req),
     "apply": _apply_cmd,
     "close": _close_cmd,
+    "monitor": lambda req: _with_symbol(req, lambda s: monitor.start(state, s, req.get("user"))),
+    "unmonitor": lambda req: _with_symbol(req, lambda s: monitor.stop(state, s)),
 }
+
+
+def _with_symbol(req: dict, fn) -> dict:
+    sym, why = _symbol_arg(req)
+    return {"ok": False, "text": why} if why else fn(sym)
+
+
+def refresh_monitors():
+    for sym in C.enabled_symbols():
+        if monitor.active(state, sym):
+            monitor.refresh(state, sym, LABELS.get(sym), LAST_DF.get(sym))
 PLACE_GATES: list = []                                             # callables req -> refusal text or None
 
 
@@ -625,7 +660,7 @@ def main():
     if alerts.start_discord_listener():
         notifier.BOT_CLIENT["on"] = True
         log.info("Discord commands starting: /chart /alert /alerts and /place (%s)", "ON" if C.PLACE_ENABLED else "off")
-    backoff, announced, last_flush = 5, False, 0.0
+    backoff, announced, last_flush, warmed = 5, False, 0.0, False
     while True:
         try:
             if weekend_pause():
@@ -641,6 +676,8 @@ def main():
                 heartbeat(wait); time.sleep(wait); continue
             backoff = 5
             report_recovered()
+            if not warmed:
+                warm_start(); warmed = True
             note = signals.pop_clock_note()
             if note:
                 notifier.deliver(state, notifier.warn("MT5 clock corrected", note, symbol=syms()))
@@ -649,6 +686,7 @@ def main():
                     check_ema(tf, sym)
             process_commands()
             positions.track(state, LABELS)                         # opened / closed / MAX POINT giveback
+            refresh_monitors()
             check_price_alerts(C.TIMEFRAMES[0])
             if not announced:
                 announce_start(); announced = True

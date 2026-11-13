@@ -268,6 +268,8 @@ def can_trade(user_id: int, channel_id: int) -> bool:
 
 EXTRA_COMMANDS: list = [           # (name, description): simple [symbol] commands; the bot loop does the work
     ("positions", "Open positions, stops, next trailing step, account totals"),
+    ("monitor", "Live monitor card for a symbol (stays on until /unmonitor)"),
+    ("unmonitor", "Stop the live monitor card"),
 ]
 
 
