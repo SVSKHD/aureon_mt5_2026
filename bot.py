@@ -13,6 +13,7 @@ import pandas as pd
 import MetaTrader5 as mt5
 import config as C
 import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report, updater
+import uploader
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -289,6 +290,8 @@ def check_ema(tf: str, symbol: str | None = None):
             for fk, _ in folded:
                 state.mark(fk)
             state.mark(key)
+    run_stage(f"bar records {symbol}", record_bars, symbol, tf, df, LAST_BARS.get(symbol, lab and labels.prepare(df)),
+              since + timedelta(seconds=1) if since else df["time"].iloc[len(df) - todo])
     state.checkpoint(tf, newest, symbol)
     fresh = [(bt, e) for _, bt, e in live]
     for hook in CANDLE_HOOKS:                                      # positions (TSL, in-trade alerts), monitor, ...
@@ -334,9 +337,39 @@ EVENT_HOOKS: list = [lambda symbol, tf, bt, e: positions.event_lines(state, symb
 def update_labels(symbol: str, df) -> "labels.Result":
     """Re-run the label engine over every closed candle we hold. Pure and deterministic, so a restart rebuilds
     exactly the same label, pullback and TSL state."""
-    res = labels.run(labels.prepare(df))
-    LABELS[symbol], LAST_DF[symbol] = res, df
+    bars = labels.prepare(df)
+    res = labels.run(bars)
+    LABELS[symbol], LAST_DF[symbol], LAST_BARS[symbol] = res, df, bars
     return res
+
+
+LAST_BARS: dict = {}                                               # symbol -> labels.prepare(df): cleaned bars + ATR14
+
+
+def record_bars(symbol: str, tf: str, df, bars, first_new) -> None:
+    """One "bar" record per newly closed candle (missed ones after an outage too), from values the bot already
+    computed: OHLC, tick volume and spread from MT5's candles, EMA 8/32/200 from signals.fetch, ATR14 = the label
+    engine's Wilder ATR on bad-tick-cleaned bars. No MT5 call here. RECORD_BARS=0 turns it off."""
+    if not C.RECORD_BARS:
+        return
+    off = signals._server_offset
+    for i in range(len(df)):
+        t = df["time"].iloc[i]
+        if t < first_new:
+            continue
+        row = df.iloc[i]
+        srv = t.to_pydatetime()
+        num = lambda k: (None if k not in df or row[k] != row[k] else float(row[k]))
+        atr = bars["atr"].iloc[i] if i < len(bars) else None
+        store.record("bar", {
+            "tf": tf,
+            "bar_time_utc": (srv - off).replace(tzinfo=__import__("datetime").timezone.utc).isoformat(),
+            "bar_time_server": srv.isoformat(),
+            "open": num("open"), "high": num("high"), "low": num("low"), "close": num("close"),
+            "tick_volume": int(row["tick_volume"]) if "tick_volume" in df and row["tick_volume"] == row["tick_volume"] else None,
+            "spread": int(row["spread"]) if "spread" in df and row["spread"] == row["spread"] else None,
+            "ema8": num(f"ema{C.EMA_FAST}"), "ema32": num(f"ema{C.EMA_SLOW}"), "ema200": num(f"ema{C.EMA_TREND}"),
+            "atr14": None if atr is None or atr != atr else float(atr)}, symbol=symbol)
 
 
 LAST_DF: dict = {}                                                 # symbol -> the candles LABELS was computed on
@@ -430,7 +463,8 @@ def chart_reply(symbol: str) -> dict:
 
 
 STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else "",
-                      lambda sym: monitor.status_line(state, sym)]
+                      lambda sym: monitor.status_line(state, sym),
+                      lambda sym: uploader.status_line()]
 
 
 def status_reply(symbol: str) -> dict:
@@ -574,7 +608,8 @@ def run_stage(name: str, fn, *args) -> bool:
 
 
 NOTICE_KIND = {"updated": ("updates", False), "update_skipped": ("updates", False),
-               "rolled_back": ("alerts", True), "crashed": ("alerts", True)}
+               "rolled_back": ("alerts", True), "crashed": ("alerts", True),
+               "upload_failing": ("updates", False), "upload_recovered": ("updates", False)}
 
 
 def deliver_notices():
@@ -585,8 +620,9 @@ def deliver_notices():
         notifier.deliver(state, notifier.info(title, n.get("desc", ""), symbol=syms(), channel=channel, ping=ping,
                                               kind=f"SYSTEM_{n.get('kind', '').upper()}",
                                               color="INFO" if n.get("kind") == "updated" else "WARN"))
-        store.record("system", {"event": n.get("kind"), "detail": f"{n.get('title')} | {n.get('desc', '')}"[:500],
-                                "sha": _git_sha()})
+        if not str(n.get("kind", "")).startswith("upload_"):       # the uploader records its own events
+            store.record("system", {"event": n.get("kind"), "detail": f"{n.get('title')} | {n.get('desc', '')}"[:500],
+                                    "sha": _git_sha()})
 
 
 def safe_to_restart() -> bool:
@@ -709,6 +745,8 @@ def main():
         notifier.deliver(state, notifier.warn("State recovered", state.problem))
     log.info("Data folder: %s", C.DATA_DIR)
     chart.prune()
+    if uploader.start():                                           # RECORD_SINK=api only; never on this thread
+        log.info("Record upload ON to the Assembler API")
     if alerts.start_discord_listener():
         notifier.BOT_CLIENT["on"] = True
         log.info("Discord commands starting: /chart /alert /alerts and /place (%s)", "ON" if C.PLACE_ENABLED else "off")

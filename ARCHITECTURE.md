@@ -1,4 +1,4 @@
-# Aureon — v1.7.0
+# Aureon — v1.7.1
 
 **What it is:** a labelled trade assistant for XAUUSD on M30 (XAGUSD built in, switched off by default). It reads
 closed candles from your MT5 terminal, labels the whole life of each EMA 8/32 trend, tracks your positions, trails
@@ -16,7 +16,7 @@ stop-loss (never widening, never removing). All order code is in `trader.py`; `/
 ```
 pip install -r requirements.txt
 put at least one delivery line in .env (see ".env keys" below)
-python -m unittest discover -s tests      # 121 offline tests, no MT5 or internet needed
+python -m unittest discover -s tests      # 140 offline tests, no MT5 or internet needed
 python bot.py --check-time                # during market hours: shows the MT5 clock the bot uses
 python watchdog.py                        # run this, never bot.py directly (it also auto-updates)
 ```
@@ -35,6 +35,8 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | `weekend.py` | Friday warnings, `/place` block before the close, Monday carry-over | close anything |
 | `report.py` | `/last-week` | write state |
 | `store.py` | `record(kind, payload)` → JSONL sink (database-ready) | be read back by the bot |
+| `uploader.py` | optional: ships the JSONL records to the Assembler API from its own thread (`RECORD_SINK=api`) | call MT5, block or change anything else |
+| `backfill.py` | by hand: upload a research CSV or terminal history to the Assembler bars route | run while the bot runs (`--mt5`) |
 | `chart.py` | candle + EMA pictures (PNG) | call MT5 or the network |
 | `trader.py` | **the only module that sends order requests**: `/place`, `modify_sl` (tighten only), confirmed close | run without an explicit command (except tightening a stop) |
 | `bot.py` | the loop and its stages | indicator math, webhook code |
@@ -43,7 +45,7 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | `tests/` | fake MT5 + regression and golden tests | touch real `.env`, logs, terminal |
 
 Runtime data lives in `logs/`: `state/`, `inbox/` and `outbox/` (Discord thread ↔ loop), `alerts/`, `trades/`,
-`records/` (JSONL records), `notices/` (watchdog → bot), `charts/`, `runtime/`.
+`records/` (JSONL records, plus `rejected-*.jsonl` from the uploader), `notices/` (watchdog → bot), `charts/`, `runtime/`.
 
 ## Symbols
 
@@ -178,9 +180,31 @@ restart; they go through the same signed inbox as the commands.
 
 ## Records (database-ready)
 
-`store.record(kind, payload)`; kinds: event, alert, position, sl_change, order, command, weekly, system. Default sink:
-`logs/records/<kind>-YYYY-MM.jsonl` (`RECORD_SINK=none` turns it off). Each row: record_id, kind, utc_time,
+`store.record(kind, payload)`; kinds: event, alert, position, sl_change, order, command, weekly, system, bar. Default
+sink: `logs/records/<kind>-YYYY-MM.jsonl` (`RECORD_SINK=none` turns it off). Each row: record_id, kind, utc_time,
 server_time, version, account_login, symbol + payload. Never blocks, never raises, never read back by the bot.
+
+`bar` (1.7.1, `RECORD_BARS=1`): one record per newly closed candle per enabled symbol, missed candles after an
+outage too: tf, bar_time_utc, bar_time_server, OHLC, tick_volume, spread, ema8/32/200 (the bot's EMAs) and atr14
+(the label engine's Wilder ATR on bad-tick-cleaned bars). Built from values already computed; no extra MT5 call.
+
+### Upload to Assembler (1.7.1, optional)
+
+`RECORD_SINK=api` = JSONL **and** upload. `uploader.py` runs on its own daemon thread (never the MT5 thread),
+reads the JSONL files in order and keeps a byte cursor per file in `logs/state/upload_cursor.json` (atomic, with
+`.bak`). Only complete lines are sent; the cursor moves only after a 200. `bar` rows go to
+`POST /api/trading/mt5/bars` (runs per symbol + timeframe), everything else to `POST /api/trading/mt5/records`,
+gzip, `Authorization: Bearer`. At-least-once (the server is idempotent); JSONL files are never deleted.
+Timeout / 5xx / 503: back off 15 s → 5 min. 429: wait `Retry-After`. 401: pause, retry every 5 min, notice at once.
+413 / 422: halve the batch; a single refused row (or a row the server lists as rejected) goes to
+`logs/records/rejected-YYYY-MM.jsonl` and is skipped. One "Record upload FAILING" notice in `#updates` after 30 min
+of failures (at once for 401) and one "recovered" notice; both are also `system` records. `/status` shows
+`Record upload: on/off · last success · backlog`. The token appears only in the HTTP header.
+
+Backfill by hand: `python backfill.py --csv <file> --symbol XAUUSD --timeframe M30` (research CSV columns; missing
+EMA/ATR are computed with the bot's math) or `python backfill.py --mt5 --symbol XAUUSD --timeframe M30 --from
+2025-01-01` (needs the terminal; refuses while the bot's heartbeat is fresh). Chunks of 5,000; prints sent /
+inserted / updated / rejected.
 
 ## Auto update
 
@@ -199,6 +223,13 @@ with the files. `UPDATE_ENABLED=0` turns it off. Positions are never touched by 
 (Asia/Kolkata), `WEEKEND_WARN_FROM` (20:00), `WEEKEND_BLOCK_PLACE_MIN` (60, 0 = off), `WEEKEND_CLOSE_FALLBACK`
 (23:57 server time, only without broker history), `RECORD_SINK` (jsonl|none), `UPDATE_ENABLED` (1), `UPDATE_BRANCH`
 (main), `UPDATE_CHECK_MIN` (5).
+
+## .env keys added in 1.7.1
+
+`RECORD_SINK` (now jsonl | none | api), `ASSEMBLER_URL` (base URL, e.g. the server's Tailscale address),
+`ASSEMBLER_RECORDS_TOKEN` (bearer token), `RECORD_API_INTERVAL_S` (15), `RECORD_API_BATCH` (500, capped at 500),
+`RECORD_API_TIMEOUT_S` (10), `RECORD_BARS` (1; 0 = no bar records). `validate()` refuses `RECORD_SINK=api` without
+the URL or the token.
 
 ## Known limits (by design)
 

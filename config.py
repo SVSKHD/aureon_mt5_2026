@@ -170,8 +170,27 @@ DISCORD_WEBHOOKS = {"alerts": DISCORD_WEBHOOK,
                     "updates": env("DISCORD_WEBHOOK_UPDATES") or DISCORD_WEBHOOK,
                     "positions": env("DISCORD_WEBHOOK_POSITIONS") or DISCORD_WEBHOOK}
 
-# ---- records for a future database (section 12). "jsonl" = logs/records/<kind>-YYYY-MM.jsonl, "none" = off
+# ---- records (section 12). "jsonl" = logs/records/<kind>-YYYY-MM.jsonl, "none" = off,
+# "api" = JSONL AND upload to the Assembler API (uploader.py reads the JSONL files; they stay the source of truth)
 RECORD_SINK = env("RECORD_SINK", "jsonl")
+ASSEMBLER_URL = env("ASSEMBLER_URL").rstrip("/")
+ASSEMBLER_RECORDS_TOKEN = env("ASSEMBLER_RECORDS_TOKEN")           # never logged, recorded or shown
+
+
+def _pos_num(key: str, default: str) -> float:
+    try:
+        v = float(env(key, default))
+    except ValueError:
+        raise SystemExit(f"{key} in .env must be a number")
+    if v <= 0:
+        raise SystemExit(f"{key} in .env must be greater than 0")
+    return v
+
+
+RECORD_API_INTERVAL_S = _pos_num("RECORD_API_INTERVAL_S", "15")    # seconds between upload passes
+RECORD_API_BATCH = int(min(_pos_num("RECORD_API_BATCH", "500"), 500))   # rows per request, capped at 500
+RECORD_API_TIMEOUT_S = _pos_num("RECORD_API_TIMEOUT_S", "10")      # per request
+RECORD_BARS = env("RECORD_BARS", "1") != "0"                       # also record closed candles (kind "bar")
 
 # ---- chart snapshot attached to signal alerts (Discord) and returned by /chart ----
 CHART_ENABLED = True
@@ -296,8 +315,15 @@ def validate(symbol_check=None) -> list[str]:
             if why:
                 bad.append(f"symbol {s} (broker name {broker_symbol(s)!r}) {why} — add it to MT5 Market Watch "
                            f"or fix SYMBOL_MAP")
-    if RECORD_SINK not in ("jsonl", "none"):
-        bad.append("RECORD_SINK must be jsonl or none")
+    if RECORD_SINK not in ("jsonl", "none", "api"):
+        bad.append("RECORD_SINK must be jsonl, none or api")
+    if RECORD_SINK == "api":
+        if not ASSEMBLER_URL:
+            bad.append("RECORD_SINK=api needs ASSEMBLER_URL (the Assembler base URL) in .env")
+        elif not ASSEMBLER_URL.startswith(("http://", "https://")):
+            bad.append("ASSEMBLER_URL must start with http:// or https://")
+        if not ASSEMBLER_RECORDS_TOKEN:
+            bad.append("RECORD_SINK=api needs ASSEMBLER_RECORDS_TOKEN (the bearer token) in .env")
     if not (DISCORD_WEBHOOK or SLACK_WEBHOOK or NTFY_TOPIC):
         bad.append(f"no delivery configured: set DISCORD_WEBHOOK, SLACK_WEBHOOK and/or NTFY_TOPIC in {ENV_FILE}")
     for tf in TIMEFRAMES:
