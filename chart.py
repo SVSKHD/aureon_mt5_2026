@@ -8,16 +8,24 @@ UP, DOWN, BG, GRID, TEXT = "#26a69a", "#ef5350", "#131722", "#2a2e39", "#d1d4dc"
 EMA_COLORS = {C.EMA_FAST: "#f5c542", C.EMA_SLOW: "#42a5f5", C.EMA_TREND: "#e040fb"}
 
 
-def render(df, tf: str, title: str, to_ist, mark_last: str | None = None, price_line: float | None = None) -> str | None:
+def render(df, tf: str, title: str, to_ist, mark_last: str | None = None, price_line: float | None = None,
+           symbol: str | None = None, bars: int | None = None, marks: list | None = None,
+           lines: list | None = None) -> str | None:
     """df: bars with time/open/high/low/close/ema columns (oldest first). to_ist: server datetime -> IST datetime.
-    mark_last: "BULL" / "BEAR" draws an arrow on the last candle. price_line: a dashed level (live price)."""
+    mark_last: "BULL" / "BEAR" draws an arrow on the last candle. price_line: a dashed level (live price).
+    bars: candles shown (default CHART_BARS). marks: [(bar_time, "BULL"|"BEAR")] arrows (week chart crosses).
+    lines: [(price, label)] extra dashed levels (entry, SL)."""
     try:
         import matplotlib
         matplotlib.use("Agg")                                     # no window, safe in a background process
         import matplotlib.pyplot as plt
         from datetime import timedelta
 
-        d = df.tail(C.CHART_BARS).reset_index(drop=True)
+        df = df.copy()
+        for p in EMA_COLORS:                                      # candles without EMA columns: compute them
+            if f"ema{p}" not in df:
+                df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
+        d = df.tail(bars or C.CHART_BARS).reset_index(drop=True)
         x = range(len(d))
         fig, ax = plt.subplots(figsize=(10, 5.4), dpi=100)
         fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
@@ -35,6 +43,15 @@ def render(df, tf: str, title: str, to_ist, mark_last: str | None = None, price_
             up = mark_last == "BULL"
             y = d["low"].iloc[-1] - span * 0.04 if up else d["high"].iloc[-1] + span * 0.04
             ax.scatter([last], [y], marker="^" if up else "v", s=160, color=UP if up else DOWN, zorder=5)
+        times = list(d["time"])
+        for t, direction in marks or []:
+            if t in times:
+                k = times.index(t); up = direction == "BULL"
+                y = d["low"].iloc[k] - span * 0.03 if up else d["high"].iloc[k] + span * 0.03
+                ax.scatter([k], [y], marker="^" if up else "v", s=90, color=UP if up else DOWN, zorder=5)
+        for level, label in lines or []:
+            ax.axhline(level, color="#ffb74d", linewidth=0.8, linestyle=":", alpha=0.9)
+            ax.text(last + 0.6, level, f"{label} {level:.2f}", color="#ffb74d", fontsize=8, va="center")
         if price_line:
             ax.axhline(price_line, color=TEXT, linewidth=0.8, linestyle="--", alpha=0.7)
             ax.text(last + 0.6, price_line, f"{price_line:.2f}", color=TEXT, fontsize=9, va="center")
@@ -56,7 +73,7 @@ def render(df, tf: str, title: str, to_ist, mark_last: str | None = None, price_
         ax.legend(loc="upper left", frameon=False, labelcolor=TEXT, fontsize=9, ncol=3)
 
         os.makedirs(C.CHART_DIR, exist_ok=True)
-        path = os.path.join(C.CHART_DIR, f"{C.SYMBOL}-{tf}-{int(time.time() * 1000)}.png")
+        path = os.path.join(C.CHART_DIR, f"{symbol or C.SYMBOL}-{tf}-{time.time_ns()}.png")
         fig.savefig(path, facecolor=BG, bbox_inches="tight")
         plt.close(fig)
         return path

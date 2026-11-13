@@ -6,6 +6,7 @@ from datetime import timedelta
 import requests
 import config as C
 import signals
+import store
 
 log = logging.getLogger("notifier")
 _last_fail_notice = {}
@@ -59,12 +60,22 @@ class State:
     def __init__(self, path=C.STATE_FILE):
         self.path = path
         self.d, self.problem = load_json(path, {"keys": [], "last_bar": {}, "pending": [], "last_price_check": None})
+        self._migrate()
         if self.problem:
             log.error(self.problem)
             if not self.d["keys"]:                                 # total reset -> no duplicates thanks to the log
                 self.d["keys"] = keys_from_log()
                 self.problem += f"; {len(self.d['keys'])} dedupe keys rebuilt from alerts.log"
                 self.save()
+
+    def _migrate(self):
+        """v2.1 kept one symbol's checkpoints un-namespaced ("M30"); 1.7.0 keys them "XAUUSD:M30"."""
+        lb = self.d.get("last_bar") or {}
+        for k in [k for k in lb if ":" not in k]:
+            lb.setdefault(f"{C.SYMBOL}:{k}", lb.pop(k))
+        lpc = self.d.get("last_price_check")
+        if lpc is None or isinstance(lpc, str):
+            self.d["last_price_check"] = {C.SYMBOL: lpc} if lpc else {}
 
     def save(self):
         save_json(self.path, self.d)
@@ -74,11 +85,15 @@ class State:
     def mark(self, key):
         self.d["keys"] = (self.d["keys"] + [key])[-3000:]; self.save()
 
-    def checkpoint(self, tf, bar_time):
-        self.d["last_bar"][tf] = str(bar_time); self.save()
+    def checkpoint(self, tf, bar_time, symbol: str | None = None):
+        self.d["last_bar"][f"{symbol or C.SYMBOL}:{tf}"] = str(bar_time); self.save()
+
+    def last_bar(self, tf, symbol: str | None = None):
+        return self.d["last_bar"].get(f"{symbol or C.SYMBOL}:{tf}")
 
     def queue(self, msg, to: list[str]):
-        p = self.d["pending"] + [{"text": msg, "ts": time.time(), "to": to}]
+        sym = msg.get("symbol") if isinstance(msg, dict) else None
+        p = self.d["pending"] + [{"text": msg, "ts": time.time(), "to": to, "symbol": sym}]
         if len(p) > C.MAX_PENDING:                               # never drop silently: fold the oldest into a summary
             cut = len(p) - C.MAX_PENDING
             p = [{"text": f"📦 {cut} older alerts could not be queued; full text is in logs/alerts/",
@@ -88,6 +103,51 @@ class State:
 
 def configured() -> list[str]:
     return [n for n, (url, _) in SERVICES.items() if url]
+
+
+def channel_of(msg) -> str:
+    return msg.get("channel") or "alerts" if isinstance(msg, dict) else "alerts"
+
+
+def _url(name: str, channel: str) -> str:
+    if name == "Discord":
+        return C.DISCORD_WEBHOOKS.get(channel) or C.DISCORD_WEBHOOK
+    return SERVICES[name][0]
+
+
+def _services_for(msg) -> list[str]:
+    """Slack and ntfy only carry the #alerts set (section 11); Discord carries every channel."""
+    return ["Discord"] if channel_of(msg) != "alerts" else list(SERVICES)
+
+
+# ---- the bot-client path: cards with buttons, and cards edited in place, go to the Discord thread through
+# logs/outbox/ (one writer each way, like the inbox). Set by bot.py once the Discord listener is running.
+BOT_CLIENT = {"on": False}
+
+
+def interactive(msg) -> bool:
+    return (isinstance(msg, dict) and BOT_CLIENT["on"] and bool(C.DISCORD_CHANNEL_IDS.get(channel_of(msg)))
+            and bool(msg.get("buttons") or msg.get("upsert")))
+
+
+def outbox_put(msg) -> str:
+    """Hand a card to the Discord thread. Returns 'ok' once it is durably on disk."""
+    try:
+        import uuid
+        os.makedirs(C.OUTBOX_DIR, exist_ok=True)
+        base = os.path.join(C.OUTBOX_DIR, f"{time.time():017.6f}-{uuid.uuid4().hex[:8]}")
+        with open(base + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({**msg, "channel_id": C.DISCORD_CHANNEL_IDS.get(channel_of(msg))}, f, default=str)
+        os.replace(base + ".tmp", base + ".json")
+        return "ok"
+    except OSError:
+        log.exception("outbox write failed")
+        return "failed"
+
+
+def button(label: str, action: str, *args, style: str = "secondary") -> dict:
+    """A button on a card. Pressing it sends a signed command back through the inbox (alerts.py)."""
+    return {"label": label, "id": ":".join(["aureon", action, *[str(a) for a in args]]), "style": style}
 
 
 def _post(url, payload, name, attempts: int = 3) -> str:
@@ -127,12 +187,21 @@ COLORS = {"BULL": 0x2ECC71, "BEAR": 0xE74C3C, "CAUTION": 0xF1C40F, "WARN": 0xE67
 
 
 def card(title: str, desc: str = "", color: str = "INFO", fields: list | None = None, footer: str = "",
-         ping: bool = False, image: str | None = None) -> dict:
+         ping: bool = False, image: str | None = None, channel: str = "alerts", symbol: str | None = None,
+         kind: str = "", buttons: list | None = None, upsert: str | None = None) -> dict:
     """A notification card. fields = [(name, value, inline)]. Sent as a Discord embed / Slack attachment.
     ping=True: buzz the phone (Discord mention + readable push line, high-priority ntfy).
-    image: path of a chart PNG, shown inside the Discord card."""
-    return {"title": title, "desc": desc, "color": color, "fields": fields or [], "footer": footer, "ping": ping,
-            "image": image}
+    image: path of a chart PNG, shown inside the Discord card.
+    channel: alerts | updates | positions (section 11). kind: what it is, for the records.
+    buttons: [button(...)] - shown when the Discord bot client is running. upsert: a stable key; the Discord thread
+    EDITS the message it posted under that key instead of posting a new one (status / monitor cards)."""
+    out = {"title": title, "desc": desc, "color": color, "fields": fields or [], "footer": footer, "ping": ping,
+           "image": image, "channel": channel if channel in C.CHANNELS else "alerts", "symbol": symbol, "kind": kind}
+    if buttons:
+        out["buttons"] = buttons
+    if upsert:
+        out["upsert"] = upsert
+    return out
 
 
 def plain(msg) -> str:
@@ -201,12 +270,24 @@ def send(msg, only: list[str] | None = None, key: str | None = None, attempts: i
     log.info("ALERT %s", plain(msg).replace("\n", " | "))
     if only is None:
         _logfile(msg, key)
-    names = [n for n in SERVICES if only is None or n in only]
+    chan = channel_of(msg)
+    names = [n for n in _services_for(msg) if only is None or n in only]
     if not names:
         return {}
+
+    def one(n):
+        if n == "Discord" and interactive(msg):
+            return outbox_put(msg)                               # buttons / edit-in-place: the bot client posts it
+        return _post(_url(n, chan), SERVICES[n][1](msg), n, attempts)
     with ThreadPoolExecutor(max_workers=len(names)) as ex:
-        results = list(ex.map(lambda n: _post(SERVICES[n][0], SERVICES[n][1](msg), n, attempts), names))
+        results = list(ex.map(one, names))
     status = dict(zip(names, results))
+    if only is None:
+        store.record("alert", {"channel": chan, "alert_kind": msg.get("kind", "") if isinstance(msg, dict) else "text",
+                               "title": msg.get("title") if isinstance(msg, dict) else str(msg)[:200],
+                               "dedupe_key": key, "delivered": [n for n, st in status.items() if st == "ok"],
+                               "failed": failed_services(status)},
+                     symbol=msg.get("symbol") if isinstance(msg, dict) else None)
     delivered = [n for n, s in status.items() if s == "ok"]
     for name in (n for n, s in status.items() if s == "failed"):
         if time.time() - _last_fail_notice.get(name, 0) < C.FAIL_NOTICE_COOLDOWN:
@@ -214,7 +295,7 @@ def send(msg, only: list[str] | None = None, key: str | None = None, attempts: i
         _last_fail_notice[name] = time.time()
         notice = f"⚠️ {name} webhook is failing — alerts still arrive here. Check the {name} URL."
         for other in delivered:
-            url, build = SERVICES[other]; _post(url, build(notice), other)
+            _post(_url(other, chan), SERVICES[other][1](notice), other)
     return status
 
 
@@ -259,19 +340,35 @@ TITLES = {
     "CROSS_AFTER_TREND":  f"EMA {C.EMA_FAST}/{C.EMA_SLOW} CROSS ✔ with EMA{C.EMA_TREND}",
     "FAST_X_TREND":       f"EMA {C.EMA_FAST} × EMA{C.EMA_TREND}",
     "SLOW_X_TREND":       f"EMA {C.EMA_SLOW} × EMA{C.EMA_TREND}",
-    "PARALLEL_TREND":     f"EMA {C.EMA_FAST}+{C.EMA_SLOW} × EMA{C.EMA_TREND} TOGETHER",
+    "PARALLEL_TREND":     f"BOTH × EMA{C.EMA_TREND} (EMA {C.EMA_FAST}+{C.EMA_SLOW} together)",
     "PRE_CROSS":          f"PRE-CROSS {C.EMA_FAST}/{C.EMA_SLOW}",
     "PRE_CROSS_FAILED":   f"PRE-CROSS FAILED",
     "NARROW_ZONE_START":  f"NARROW ZONE — chop",
     "NARROW_ZONE_END":    f"NARROW ZONE ENDED",
+    # label engine (labels.py)
+    "GAP WIDENING":       "GAP WIDENING",
+    "PARALLEL RUNNING":   "PARALLEL RUNNING",
+    "WIDE GAP":           "WIDE GAP",
+    "GAP PEAKED":         "GAP PEAKED",
+    "PULLBACK STARTED":   "PULLBACK STARTED",
+    "RE-ENTRY":           "RE-ENTRY",
+    "PULLBACK FAILED":    "PULLBACK FAILED",
+    "PRE-CROSS":          "PRE-CROSS",
+    "PRE-CROSS FAILED":   "PRE-CROSS FAILED",
 }
-ARROW = {"BULL": "▲ BULL", "BEAR": "▼ BEAR", "UNCLEAR": "◆ UNCLEAR"}
+ARROW = {"BULL": "▲ BULL", "BEAR": "▼ BEAR", "UNCLEAR": "◆ UNCLEAR", "LONG": "▲ LONG", "SHORT": "▼ SHORT"}
+# where each event goes (section 11). Anything not listed: #alerts.
+CHANNEL = {"GAP WIDENING": "updates", "PARALLEL RUNNING": "updates", "WIDE GAP": "updates",
+           "PULLBACK STARTED": "updates", "RE-ENTRY": "updates", "NARROW_ZONE_START": "updates",
+           "NARROW_ZONE_END": "updates"}
+PINGS = C.PING_TYPES | {"PRE-CROSS", "PRE-CROSS FAILED", "GAP PEAKED", "PULLBACK FAILED"}
 
 
 def _color(e) -> str:
-    if e["type"] in ("NARROW_ZONE_START", "PRE_CROSS", "PRE_CROSS_FAILED") or e["dir"] == "UNCLEAR":
+    if e["type"] in ("NARROW_ZONE_START", "PRE_CROSS", "PRE_CROSS_FAILED", "PRE-CROSS", "PRE-CROSS FAILED",
+                     "GAP PEAKED", "PULLBACK STARTED", "PULLBACK FAILED") or e["dir"] == "UNCLEAR":
         return "CAUTION"
-    return "BULL" if e["dir"] == "BULL" else "BEAR"
+    return "BULL" if e["dir"] in ("BULL", "LONG") else "BEAR"
 
 
 def _emoji(e) -> str:
@@ -285,10 +382,24 @@ def _context(e) -> str:
     if t == "NARROW_ZONE_END":
         box = f"box {e['zone_lo']:.0f}–{e['zone_hi']:.0f} · {e['bars']} bars"
         return box + (" · price confirms" if e["dir"] != "UNCLEAR" else " · price still inside")
-    if t == "PRE_CROSS_FAILED":
-        return f"gap {e['gap']:.2f} · diverging again"
-    if t == "PRE_CROSS":
-        return "converging · cross likely next bars"
+    if t in ("PRE_CROSS_FAILED", "PRE-CROSS FAILED"):
+        return f"{e.get('pair', '8/32')} · diverging again · watch only"
+    if t in ("PRE_CROSS", "PRE-CROSS"):
+        return (f"{e.get('pair', '8/32')} · {e.get('dist', 0):.2f} apart ({e.get('dist_atr', 0):.2f} ATR) · "
+                f"converging · WATCH SIGNAL, not a trade signal")
+    if t.startswith("CROSS"):
+        out = f"tag {e['tag']}" if e.get("tag") else ""
+        if e.get("lesser_gap"):
+            out += " · LESSER GAP"
+        fin = e.get("finished")
+        if fin:
+            side = "long" if fin["side"] > 0 else "short"
+            out += f" · TREND FINISHED: the {side} ran {fin['ran']:+.2f} in {fin['bars']} candles"
+        return out.strip(" ·")
+    if t in ("PULLBACK STARTED",):
+        return f"pre-pullback extreme {e.get('pre_extreme', 0):.2f}"
+    if t == "RE-ENTRY":
+        return f"pullback extreme {e.get('pullback_extreme', 0):.2f}"
     return ""
 
 
@@ -297,48 +408,71 @@ def _times(tf, bar_time) -> tuple[str, str]:
     return f"{signals.to_ist(close_time):%d %b %H:%M} IST", f"{close_time:%H:%M} server"
 
 
-def format_event(tf, bar_time, e, missed=False, image=None) -> dict:
-    """Live alert card."""
+def format_event(tf, bar_time, e, missed=False, image=None, symbol: str | None = None, status: str = "",
+                 extra: list | None = None, buttons: list | None = None) -> dict:
+    """Live alert card. Title starts with the symbol. status = the present market status line."""
+    symbol = symbol or C.SYMBOL
     ist, srv = _times(tf, bar_time)
-    title = f"{_emoji(e)} {C.SYMBOL} {tf} · {TITLES[e['type']]} {ARROW[e['dir']]}"
+    name = TITLES.get(e['type'], e['type']) + (f" {e['pair']}" if e.get("pair") else "")
+    title = f"{symbol} {_emoji(e)} {tf} · {name} {ARROW.get(e['dir'], e['dir'])}"
     if missed:
-        title = "⚠️ MISSED · " + title
+        title = f"{symbol} ⚠️ MISSED · " + title[len(symbol) + 1:]
     fields = [("Price", f"{e['price']:.2f}"), ("Candle closed", ist)]
     ctx = _context(e)
     if ctx:
         fields.append(("Note", ctx, False))
-    return card(title, color=_color(e), fields=fields, footer=srv, ping=e["type"] in C.PING_TYPES, image=image)
+    if status:
+        fields.append(("Market now", status, False))
+    for f in extra or []:
+        fields.append(f)
+    return card(title, color=_color(e), fields=fields, footer=srv, ping=e["type"] in PINGS and not missed, image=image,
+                channel=CHANNEL.get(e["type"], "alerts"), symbol=symbol, kind=e["type"], buttons=buttons)
 
 
-def event_caption(tf, bar_time, e) -> str:
+def event_caption(tf, bar_time, e, symbol: str | None = None) -> str:
     """Plain-text chart title (no emoji: chart fonts do not have them)."""
     ist, _ = _times(tf, bar_time)
-    arrow = {"BULL": "BULL", "BEAR": "BEAR", "UNCLEAR": "UNCLEAR"}[e["dir"]]
-    return f"{C.SYMBOL} {tf} · {TITLES[e['type']].replace('✔ ', '')} · {arrow} · {e['price']:.2f} · {ist}"
+    arrow = {"BULL": "BULL", "BEAR": "BEAR", "UNCLEAR": "UNCLEAR", "LONG": "LONG", "SHORT": "SHORT"}.get(e["dir"], e["dir"])
+    return f"{symbol or C.SYMBOL} {tf} · {TITLES.get(e['type'], e['type']).replace('✔ ', '')} · {arrow} · {e['price']:.2f} · {ist}"
 
 
 def digest_line(tf, bar_time, e) -> str:
     close_time = bar_time.to_pydatetime() + timedelta(minutes=C.BAR_MINUTES[tf])
-    return f"{_emoji(e)} `{signals.to_ist(close_time):%d %b %H:%M}` {TITLES[e['type']]} {ARROW[e['dir']]} @ **{e['price']:.2f}**"
+    return (f"{_emoji(e)} `{signals.to_ist(close_time):%d %b %H:%M}` {TITLES.get(e['type'], e['type'])}"
+            f"{' ' + e['pair'] if e.get('pair') else ''} "
+            f"{ARROW.get(e['dir'], e['dir'])} @ **{e['price']:.2f}**")
 
 
-def format_digest(tf, lines: list[str], first_bar, last_bar, n_bars: int, status: str) -> dict:
+def format_digest(tf, lines: list[str], first_bar, last_bar, n_bars: int, status: str, symbol: str | None = None) -> dict:
+    symbol = symbol or C.SYMBOL
     shown = lines[-C.DIGEST_MAX_LINES:]
     earlier = len(lines) - len(shown)
     f_ist = signals.to_ist(first_bar.to_pydatetime())
     l_ist = signals.to_ist(last_bar.to_pydatetime() + timedelta(minutes=C.BAR_MINUTES[tf]))
     desc = (f"… {earlier} earlier events in logs/alerts/\n" if earlier else "") + \
            ("\n".join(shown) if shown else "no signals in that window")
-    return card(f"⚠️ {C.SYMBOL} {tf} · MISSED WHILE OFFLINE", desc, "WARN",
+    return card(f"{symbol} ⚠️ {tf} · MISSED WHILE OFFLINE", desc, "WARN",
                 fields=[("Window", f"{n_bars} bars · {f_ist:%d %b %H:%M} → {l_ist:%d %b %H:%M} IST", False),
-                        ("Now", status, False)])
+                        ("Now", status, False)], symbol=symbol, kind="DIGEST")
 
 
-def format_price_alert(level, price, status, now_server) -> dict:
-    return card(f"🎯 {C.SYMBOL} HIT {level:.2f}", color="HIT", ping=True,
+def format_price_alert(level, price, status, now_server, symbol: str | None = None) -> dict:
+    symbol = symbol or C.SYMBOL
+    return card(f"{symbol} 🎯 HIT {level:.2f}", color="HIT", ping=True,
                 fields=[("Now", f"{price:.2f}"), ("Time", f"{signals.to_ist(now_server):%H:%M} IST"),
-                        ("EMA state", status, False)])
+                        ("EMA state", status, False)], symbol=symbol, kind="PRICE_ALERT")
 
 
-def warn(title: str, desc: str = "", ping: bool = False) -> dict:
-    return card(f"⚠️ {title}", desc, "WARN", ping=ping)
+def warn(title: str, desc: str = "", ping: bool = False, symbol: str | None = None, channel: str = "alerts",
+         kind: str = "WARN") -> dict:
+    """A warning card. With a symbol, the title starts with it."""
+    return card(f"{symbol} ⚠️ {title}" if symbol else f"⚠️ {title}", desc, "WARN", ping=ping, symbol=symbol,
+                channel=channel, kind=kind)
+
+
+def info(title: str, desc: str = "", symbol: str | None = None, channel: str = "alerts", fields: list | None = None,
+         kind: str = "INFO", ping: bool = False, buttons: list | None = None, upsert: str | None = None,
+         image: str | None = None, color: str = "INFO") -> dict:
+    """An information card; title starts with the symbol when there is one."""
+    return card(f"{symbol} {title}" if symbol else title, desc, color, fields=fields, symbol=symbol, channel=channel,
+                kind=kind, ping=ping, buttons=buttons, upsert=upsert, image=image)

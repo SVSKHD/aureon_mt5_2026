@@ -36,7 +36,62 @@ def env(key: str, default: str = "") -> str:
     return val if val != "" else default
 
 
-SYMBOL = env("SYMBOL", "XAUUSD")
+def _version() -> str:
+    try:
+        with open(os.path.join(PROJECT_DIR, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip() or "0.0.0"
+    except OSError:
+        return "0.0.0"
+
+
+VERSION = _version()             # major + minor always add up to 8: 1.7.x -> 2.6.x -> 3.5.x; the third number = fixes
+
+# ---- symbols: one process, one loop, M30. A disabled symbol is fully supported but skipped by the loop (no data reads,
+# no alerts, no TSL, no monitor). Enable one in .env (ENABLED_SYMBOLS=XAUUSD,XAGUSD) + restart: .env is not tracked by
+# git, so the auto-updater still sees a clean tree. Per-symbol values: ("price", x) = price units, ("atr", x) = x * ATR(14).
+SYMBOLS = {
+    "XAUUSD": {"enabled": True,                      # values from the 22-month M30 study
+               "tsl_buffer": ("price", 5.0), "maxpoint_giveback": ("price", 10.0), "maxpoint_min_profit": ("price", 20.0)},
+    "XAGUSD": {"enabled": False,                     # ATR equivalents of the gold values, NOT tested on silver data
+               "tsl_buffer": ("atr", 0.4), "maxpoint_giveback": ("atr", 0.75), "maxpoint_min_profit": ("atr", 1.5)},
+}
+if env("ENABLED_SYMBOLS"):
+    _on = {x.strip().upper() for x in env("ENABLED_SYMBOLS").replace(";", ",").split(",") if x.strip()}
+    for _name, _cfg in SYMBOLS.items():
+        _cfg["enabled"] = _name in _on
+# logical name -> broker name, for brokers that add a suffix (XAUUSD -> XAUUSD.m). .env: SYMBOL_MAP=XAUUSD:XAUUSD.m,XAGUSD:XAGUSD.m
+SYMBOL_MAP = {k.strip().upper(): v.strip() for k, v in
+              (x.split(":", 1) for x in env("SYMBOL_MAP").replace(";", ",").split(",") if ":" in x)}
+
+
+def enabled_symbols() -> list[str]:
+    return [s for s, c in SYMBOLS.items() if c.get("enabled")]
+
+
+def is_enabled(symbol: str) -> bool:
+    return bool(SYMBOLS.get(str(symbol).upper(), {}).get("enabled"))
+
+
+def broker_symbol(symbol: str) -> str:
+    return SYMBOL_MAP.get(symbol, symbol)
+
+
+def logical_symbol(broker_name: str) -> str | None:
+    for s in SYMBOLS:
+        if broker_symbol(s) == broker_name:
+            return s
+    return None
+
+
+def sym_value(symbol: str, key: str, atr: float | None) -> float | None:
+    """A per-symbol value in price units. ATR-based values need the current ATR (None if it is unknown)."""
+    kind, x = SYMBOLS[symbol][key]
+    if kind == "price":
+        return float(x)
+    return None if not atr else float(x) * float(atr)
+
+
+SYMBOL = (enabled_symbols() or list(SYMBOLS))[0]     # the primary symbol (clock, defaults for commands)
 TIMEFRAMES = ["M30"]
 BAR_MINUTES = {"M15": 15, "M30": 30, "H1": 60, "H4": 240}
 
@@ -98,6 +153,26 @@ try:                                                             # optional: onl
     DISCORD_ALLOWED_USER_IDS = {int(x) for x in env("DISCORD_ALLOWED_USER_IDS").replace(";", ",").split(",") if x.strip()}
 except ValueError:
     raise SystemExit("DISCORD_ALLOWED_USER_IDS in .env must be numbers separated by commas")
+# ---- Discord channels (section 11). The bot client posts by channel ID; webhooks per channel are optional.
+# Anything not configured falls back: channel id -> DISCORD_ALERT_CHANNEL_ID, webhook -> DISCORD_WEBHOOK.
+def _int(key: str) -> int:
+    try:
+        return int(env(key, "0"))
+    except ValueError:
+        raise SystemExit(f"{key} in .env must be a number (right-click channel -> Copy Channel ID)")
+
+
+CHANNELS = ("alerts", "updates", "positions")
+DISCORD_CHANNEL_IDS = {"alerts": _int("DISCORD_CHANNEL_ALERTS") or DISCORD_ALERT_CHANNEL_ID,
+                       "updates": _int("DISCORD_CHANNEL_UPDATES") or _int("DISCORD_CHANNEL_ALERTS") or DISCORD_ALERT_CHANNEL_ID,
+                       "positions": _int("DISCORD_CHANNEL_POSITIONS") or _int("DISCORD_CHANNEL_ALERTS") or DISCORD_ALERT_CHANNEL_ID}
+DISCORD_WEBHOOKS = {"alerts": DISCORD_WEBHOOK,
+                    "updates": env("DISCORD_WEBHOOK_UPDATES") or DISCORD_WEBHOOK,
+                    "positions": env("DISCORD_WEBHOOK_POSITIONS") or DISCORD_WEBHOOK}
+
+# ---- records for a future database (section 12). "jsonl" = logs/records/<kind>-YYYY-MM.jsonl, "none" = off
+RECORD_SINK = env("RECORD_SINK", "jsonl")
+
 # ---- chart snapshot attached to signal alerts (Discord) and returned by /chart ----
 CHART_ENABLED = True
 CHART_BARS = 80                 # candles shown
@@ -145,7 +220,9 @@ ALERT_LOG_DIR = os.path.join(DATA_DIR, "alerts")
 RUNTIME_LOG_DIR = os.path.join(DATA_DIR, "runtime")
 CHART_DIR = os.path.join(DATA_DIR, "charts")
 TRADE_LOG_DIR = os.path.join(DATA_DIR, "trades")
-for _d in (STATE_DIR, INBOX_DIR, ALERT_LOG_DIR, RUNTIME_LOG_DIR, CHART_DIR, TRADE_LOG_DIR):
+RECORD_DIR = os.path.join(DATA_DIR, "records")
+OUTBOX_DIR = os.path.join(DATA_DIR, "outbox")               # bot loop -> Discord thread (cards with buttons, edits)
+for _d in (STATE_DIR, INBOX_DIR, ALERT_LOG_DIR, RUNTIME_LOG_DIR, CHART_DIR, TRADE_LOG_DIR, RECORD_DIR, OUTBOX_DIR):
     os.makedirs(_d, exist_ok=True)
 try:
     os.chmod(INBOX_DIR, 0o700)                                   # commands folder: this user only (no effect on Windows)
@@ -155,6 +232,7 @@ except OSError:
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 ALERTS_FILE = os.path.join(STATE_DIR, "alerts.json")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
+DISCORD_MESSAGES_FILE = os.path.join(STATE_DIR, "discord_messages.json")   # written by the Discord thread only
 WATCHDOG_LOCK = os.path.join(STATE_DIR, "watchdog.lock")
 
 
@@ -202,10 +280,24 @@ def migrate_legacy_files():
         os.rmdir(old_inbox)
 
 
-def validate() -> list[str]:
-    """Human-readable config problems (empty = fine). Checked once at startup."""
+def validate(symbol_check=None) -> list[str]:
+    """Human-readable config problems (empty = fine). Checked once at startup.
+    symbol_check(broker_name) -> None if the symbol is in Market Watch, else the reason (bot passes an MT5 probe)."""
     import re
     bad = []
+    if not enabled_symbols():
+        bad.append("no symbol is enabled in SYMBOLS")
+    for s in SYMBOL_MAP:
+        if s not in SYMBOLS:
+            bad.append(f"SYMBOL_MAP names {s}, which is not in SYMBOLS")
+    if symbol_check:
+        for s in enabled_symbols():
+            why = symbol_check(broker_symbol(s))
+            if why:
+                bad.append(f"symbol {s} (broker name {broker_symbol(s)!r}) {why} — add it to MT5 Market Watch "
+                           f"or fix SYMBOL_MAP")
+    if RECORD_SINK not in ("jsonl", "none"):
+        bad.append("RECORD_SINK must be jsonl or none")
     if not (DISCORD_WEBHOOK or SLACK_WEBHOOK or NTFY_TOPIC):
         bad.append(f"no delivery configured: set DISCORD_WEBHOOK, SLACK_WEBHOOK and/or NTFY_TOPIC in {ENV_FILE}")
     for tf in TIMEFRAMES:
