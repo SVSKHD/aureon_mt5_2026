@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report
+import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report, updater
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -46,12 +46,13 @@ def print_banner():
           f"{'/'.join(C.TIMEFRAMES)}{RESET}\n")
 
 
-def heartbeat(next_within: float):
-    """Tell the watchdog we're alive and when to expect the next beat (seconds)."""
+def heartbeat(next_within: float, safe: bool = False):
+    """Tell the watchdog we're alive and when to expect the next beat (seconds). safe = idle between passes."""
     try:
         tmp = C.HEARTBEAT_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"ts": time.time(), "next_within": next_within, "pid": os.getpid()}, f)
+            json.dump({"ts": time.time(), "next_within": next_within, "pid": os.getpid(), "safe": safe,
+                       "version": C.VERSION}, f)
         os.replace(tmp, C.HEARTBEAT_FILE)
     except Exception:
         log.exception("heartbeat write failed")
@@ -544,6 +545,55 @@ def process_commands():
         log.info("command -> %s", reply[:200].replace("\n", " | "))    # new alerts are armed at the current price
 
 
+# ---------------------------------------------------------------------------- failure handling (section 13)
+_stage_notice: dict = {}
+
+
+def run_stage(name: str, fn, *args) -> bool:
+    """Run one loop stage. A failure is logged, recorded, and reported (identical notices at most every
+    FAIL_NOTICE_COOLDOWN); the other stages still run. Returns False if the stage failed."""
+    try:
+        fn(*args)
+        return True
+    except Exception as e:
+        log.exception("stage %s failed", name)
+        sig = f"{name}:{type(e).__name__}:{str(e)[:120]}"
+        store.record("system", {"event": "stage_failed", "stage": name, "detail": f"{type(e).__name__}: {e}"[:500]})
+        if time.time() - _stage_notice.get(sig, 0) >= C.FAIL_NOTICE_COOLDOWN:
+            _stage_notice[sig] = time.time()
+            try:
+                notifier.deliver(state, notifier.warn(f"script failure in '{name}'",
+                                                      f"{type(e).__name__}: {str(e)[:300]}\nWhat the bot did: skipped this "
+                                                      f"stage for this pass; every other stage still ran. It retries on "
+                                                      f"the next pass (in ≤ {C.POLL_SECONDS} s). Same error again is "
+                                                      f"reported at most every {C.FAIL_NOTICE_COOLDOWN // 60} min.",
+                                                      ping=True, symbol=syms(), kind="SCRIPT_FAILURE"))
+            except Exception:
+                log.exception("could not report the failure")
+        return False
+
+
+NOTICE_KIND = {"updated": ("updates", False), "update_skipped": ("updates", False),
+               "rolled_back": ("alerts", True), "crashed": ("alerts", True)}
+
+
+def deliver_notices():
+    """Messages from the watchdog / updater (updates, rollbacks, crashes)."""
+    for n in updater.pop_notices():
+        channel, ping = NOTICE_KIND.get(n.get("kind"), ("alerts", True))
+        title = ("🔄 " if n.get("kind") == "updated" else "⚠️ ") + n.get("title", "notice")
+        notifier.deliver(state, notifier.info(title, n.get("desc", ""), symbol=syms(), channel=channel, ping=ping,
+                                              kind=f"SYSTEM_{n.get('kind', '').upper()}",
+                                              color="INFO" if n.get("kind") == "updated" else "WARN"))
+        store.record("system", {"event": n.get("kind"), "detail": f"{n.get('title')} | {n.get('desc', '')}"[:500],
+                                "sha": _git_sha()})
+
+
+def safe_to_restart() -> bool:
+    """At the end of a pass: nothing in flight, inbox empty, not inside candle processing."""
+    return not alerts.inbox_waiting()
+
+
 def nap(seconds: float):
     """Sleep, but wake at once when a command (/place, /chart, /alert) is waiting."""
     end = time.monotonic() + seconds
@@ -665,44 +715,63 @@ def main():
     backoff, announced, last_flush, warmed = 5, False, 0.0, False
     while True:
         try:
+            heartbeat(60)                                          # busy: inside a pass
+            run_stage("notices", deliver_notices)
             if weekend_pause():
-                notifier.flush_pending(state)
+                run_stage("retry queue", notifier.flush_pending, state)
                 continue
             problem = ensure_mt5()
             if problem:
                 report_blind(problem)
-                notifier.flush_pending(state)
+                run_stage("retry queue", notifier.flush_pending, state)
                 wait = C.POLL_SECONDS if problem.startswith(KEEP_CONNECTION) else backoff
                 if wait == backoff:
                     backoff = min(backoff * 2, 60)                 # never more than 1 min from noticing the feed is back
                 heartbeat(wait); time.sleep(wait); continue
             backoff = 5
             report_recovered()
-            if not warmed:
-                warm_start(); warmed = True
+            if not warmed:                                         # a failed warm start is reported, not retried forever
+                run_stage("warm start", warm_start); warmed = True
             note = signals.pop_clock_note()
             if note:
                 notifier.deliver(state, notifier.warn("MT5 clock corrected", note, symbol=syms()))
             for sym in C.enabled_symbols():                        # signals first: nothing may delay a fresh candle
                 for tf in C.TIMEFRAMES:
-                    check_ema(tf, sym)
-            process_commands()
-            positions.track(state, LABELS)                         # opened / closed / MAX POINT giveback
-            refresh_monitors()
-            weekend.check(state)                                   # Friday warnings (warn only, never closes)
-            check_price_alerts(C.TIMEFRAMES[0])
+                    run_stage(f"candles {sym} {tf}", check_ema, tf, sym)
+            run_stage("commands", process_commands)
+            run_stage("positions", positions.track, state, LABELS)   # opened / closed / MAX POINT giveback
+            run_stage("monitor", refresh_monitors)
+            run_stage("weekend", weekend.check, state)             # Friday warnings (warn only, never closes)
+            run_stage("price alerts", check_price_alerts, C.TIMEFRAMES[0])
             if not announced:
-                announce_start(); announced = True
-            alive_ping()
+                run_stage("start card", announce_start); announced = True
+            run_stage("alive card", alive_ping)
             if state.d["pending"] and time.time() - last_flush >= 30:    # retries after the live work, twice a minute
-                last_flush = time.time(); notifier.flush_pending(state)
+                last_flush = time.time(); run_stage("retry queue", notifier.flush_pending, state)
+            if updater.restart_requested() and safe_to_restart():  # auto update: stop HERE, at a safe moment
+                log.info("Stopping for an update at a safe moment")
+                store.record("system", {"event": "stop_for_update", "sha": _git_sha()})
+                store.flush(); mt5.shutdown()
+                updater.ready_for_restart()
+                return
             wait = next_sleep()
-            heartbeat(wait + 30)
+            heartbeat(wait + 30, safe=True)
             nap(wait)
         except KeyboardInterrupt:
-            log.info("Stopped"); mt5.shutdown(); break
-        except Exception:
+            log.info("Stopped"); store.record("system", {"event": "stop"}); store.flush(); mt5.shutdown(); break
+        except Exception as e:
             log.exception("Loop error, retrying")
+            store.record("system", {"event": "crash", "detail": f"{type(e).__name__}: {e}"[:500]})
+            sig = f"loop:{type(e).__name__}:{str(e)[:120]}"
+            if time.time() - _stage_notice.get(sig, 0) >= C.FAIL_NOTICE_COOLDOWN:
+                _stage_notice[sig] = time.time()
+                try:
+                    notifier.deliver(state, notifier.warn("script failure in the main loop",
+                                                          f"{type(e).__name__}: {str(e)[:300]}\nWhat the bot did: "
+                                                          f"disconnected from MT5 and retries in {backoff} s.",
+                                                          ping=True, symbol=syms(), kind="SCRIPT_FAILURE"))
+                except Exception:
+                    log.exception("could not report the failure")
             mt5.shutdown()
             heartbeat(backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)

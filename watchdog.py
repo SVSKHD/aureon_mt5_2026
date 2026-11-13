@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 import config as C                                    # paths + DailyFileHandler
+import updater as U
 C.migrate_legacy_files()
 
 LOCK_PATH = Path(C.WATCHDOG_LOCK)
@@ -73,6 +74,78 @@ class Watchdog:
     def __init__(self):
         self.stopping = False
         self.child: subprocess.Popen | None = None
+        self.next_check = time.monotonic() + 60          # first update check a minute after start
+        self.awaiting: dict | None = None                # update waiting for the bot's safe moment
+        self.probation: dict | None = None               # {"prev","new","started"}: new version on trial
+
+    # ---------------------------------------------------------------- auto update (spec section 14)
+    def maybe_update(self, now: float | None = None):
+        """Every UPDATE_CHECK_MIN: is there a clean fast-forward? Then ask the bot for a safe moment."""
+        now = time.monotonic() if now is None else now
+        if not U.UPDATE_ENABLED or self.awaiting or self.probation or now < self.next_check:
+            return
+        self.next_check = now + U.UPDATE_CHECK_MIN * 60
+        st = U.load_state()
+        action, reason, info = U.plan(str(ROOT))
+        remote = info.get("remote")
+        if action == "refuse":
+            if remote != st.get("last_failed_remote"):        # report once per remote head
+                files = info.get("conflicts") or info.get("dirty") or info.get("local_commits") or []
+                U.notice("update_skipped", f"Update to {remote[:7]} NOT applied — still running {U.version_at(str(ROOT))}",
+                         reason + (("\nFiles: " + ", ".join(files[:15])) if files else ""))
+                st["last_failed_remote"] = remote; U.save_state(st)
+                log.warning("update not applied: %s %s", reason, files)
+            return
+        if action != "apply" or remote == st.get("last_failed_remote"):
+            return
+        log.info("update available (%s) — asking the bot for a safe moment", reason)
+        with open(U.REQUEST_FILE, "w") as f:
+            f.write(remote)
+        self.awaiting = {"remote": remote, "deadline": now + 15 * 60}
+
+    def apply_update(self) -> None:
+        """The bot stopped itself at a safe moment: pull, then start the new version on probation."""
+        for p in (U.REQUEST_FILE, U.READY_FILE):
+            if os.path.exists(p):
+                os.remove(p)
+        want = self.awaiting or {}
+        self.awaiting = None
+        st = U.load_state()
+        ok, reason, res = U.apply(str(ROOT))
+        if not ok:
+            U.notice("update_skipped", "Update NOT applied — still running the previous version",
+                     reason + (("\nConflicts: " + ", ".join(res.get("conflicts", []))) if res.get("conflicts") else ""))
+            st["last_failed_remote"] = want.get("remote"); U.save_state(st)
+            log.error("update failed: %s", reason)
+            return
+        self.probation = {"prev": res["prev"], "new": res["new"], "started": None}
+        st["pending"] = self.probation; U.save_state(st)
+        log.info("updated %s — new version on probation for %ss", reason, U.HEALTH_SECONDS)
+
+    def probation_verdict(self, alive: bool, runtime: float, beat: bool) -> str | None:
+        """None while undecided, "ok" or a failure reason."""
+        if self.probation is None:
+            return None
+        if not alive and runtime < U.HEALTH_SECONDS:
+            return f"it crashed on start (after {runtime:.0f} s)"
+        if runtime >= U.HEALTH_SECONDS:
+            return "ok" if (alive and beat) else f"no heartbeat within {U.HEALTH_SECONDS} s"
+        return None
+
+    def finish_probation(self, verdict: str):
+        p, self.probation = self.probation, None
+        st = U.load_state(); st.pop("pending", None)
+        if verdict == "ok":
+            _, sha = U.git(str(ROOT), "rev-parse", "--short", "HEAD")
+            U.notice("updated", f"Updated to {U.version_at(str(ROOT))} ({sha})", f"{p['prev'][:7]} → {p['new'][:7]}")
+            U.save_state(st)
+            return
+        self._terminate()
+        U.rollback(str(ROOT), p["prev"])
+        st["last_failed_remote"] = p["new"]; U.save_state(st)
+        U.notice("rolled_back", f"Update {p['new'][:7]} ROLLED BACK to {p['prev'][:7]} ({U.version_at(str(ROOT))})",
+                 f"The new version failed its health check: {verdict}.")
+        log.error("rolled back to %s: %s", p["prev"][:7], verdict)
 
     def stop(self, *_):
         self.stopping = True
@@ -114,15 +187,40 @@ class Watchdog:
                 reason = None
                 while self.child.poll() is None and not self.stopping:
                     time.sleep(2)
+                    runtime = time.monotonic() - started
+                    verdict = self.probation_verdict(True, runtime, heartbeat_age() is not None)
+                    if verdict:
+                        self.finish_probation(verdict)
+                        if verdict != "ok":
+                            reason = "rolled back"; break
                     reason = self.frozen(started)
                     if reason:
                         log.error("Bot appears FROZEN (%s) — killing PID=%s", reason, self.child.pid)
+                        U.notice("crashed", "bot FROZE — restarting it", f"{reason}. Killed and restarted by the watchdog.")
                         self._terminate(); break
+                    self.maybe_update()
+                    if self.awaiting and time.monotonic() > self.awaiting["deadline"]:
+                        log.warning("bot never reached a safe moment for the update; trying again later")
+                        if os.path.exists(U.REQUEST_FILE):
+                            os.remove(U.REQUEST_FILE)
+                        self.awaiting = None
                 if self.stopping:
                     break
                 runtime = time.monotonic() - started
+                if os.path.exists(U.READY_FILE):                  # the bot stopped itself for an update
+                    self.apply_update(); delay = RESTART_INITIAL_SECONDS
+                    continue
+                if reason == "rolled back":
+                    delay = RESTART_INITIAL_SECONDS
+                    continue
+                verdict = self.probation_verdict(False, runtime, heartbeat_age() is not None)
+                if verdict:
+                    self.finish_probation(verdict); delay = RESTART_INITIAL_SECONDS
+                    continue
                 if not reason:
                     log.error("Bot exited (code=%s, uptime=%.0fs)", self.child.returncode, runtime)
+                    U.notice("crashed", "bot STOPPED unexpectedly — restarting it",
+                             f"exit code {self.child.returncode} after {runtime:.0f} s. Restarting in {delay} s.")
                 if runtime >= STABLE_AFTER_SECONDS:
                     delay = RESTART_INITIAL_SECONDS
             except OSError:
