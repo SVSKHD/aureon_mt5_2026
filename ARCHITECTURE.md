@@ -196,9 +196,11 @@ reads the JSONL files in order and keeps a byte cursor per file in `logs/state/u
 `POST /api/trading/mt5/bars` (runs per symbol + timeframe), everything else to `POST /api/trading/mt5/records`,
 gzip, `Authorization: Bearer`. At-least-once (the server is idempotent); JSONL files are never deleted.
 Timeout / 5xx / 503: back off 15 s → 5 min. 429: wait `Retry-After`. 401: pause, retry every 5 min, notice at once.
+415 (wrong `Content-Type`/`Content-Encoding`: a bug on our side, the same for every request): the same pause, logged
+once, no retry loop, nothing moved to the rejected file. `backfill.py` stops at once on 401 or 415.
 413 / 422: halve the batch; a single refused row (or a row the server lists as rejected) goes to
 `logs/records/rejected-YYYY-MM.jsonl` and is skipped. One "Record upload FAILING" notice in `#updates` after 30 min
-of failures (at once for 401) and one "recovered" notice; both are also `system` records. `/status` shows
+of failures (at once for 401 / 415) and one "recovered" notice; both are also `system` records. `/status` shows
 `Record upload: on/off · last success · backlog`. The token appears only in the HTTP header.
 
 Backfill by hand: `python backfill.py --csv <file> --symbol XAUUSD --timeframe M30` (research CSV columns; missing
