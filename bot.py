@@ -7,7 +7,7 @@ Check:  python bot.py --check-time   |   python -m unittest discover -s tests
 Setup:  pip install -r requirements.txt, keys in .env (see .env.example), MT5 terminal open and logged in.
 """
 import json, logging, os, sys, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
 import MetaTrader5 as mt5
@@ -94,33 +94,103 @@ def weekend_pause() -> bool:
 
 KEEP_CONNECTION = ("stale tick", "clock mismatch")
 _stale_loops = 0
+_mono = time.monotonic                                             # one clock for the reconnect logic (tests replace it)
+# One MT5 outage: since (monotonic), since_srv (server time, for the catch-up digest), init attempts, next attempt.
+# blind = the loop was told about it at least once (an instant successful re-initialise is not an outage).
+_link = {"since": None, "since_srv": None, "attempts": 0, "next_try": 0.0, "blind": False, "ever_up": False}
+CATCH_UP: dict = {}                                    # (symbol, tf) -> (link down, link back) in server time
+
+
+def _connect() -> str | None:
+    """shutdown + initialize. None on success, else the error."""
+    mt5.shutdown()
+    if not mt5.initialize():
+        return f"MT5 init failed: {mt5.last_error()}"
+    for sym in C.enabled_symbols():                                # disabled symbols are never touched
+        mt5.symbol_select(C.broker_symbol(sym), True)
+    signals.sync_server_offset()
+    acc = mt5.account_info()
+    store.context["account_login"] = getattr(acc, "login", None)
+    (log.debug if _link["ever_up"] else log.info)("MT5 connected (server time %s)", signals.offset_text())
+    return None
+
+
+def _link_up():
+    """Healthy feed. After an outage: ONE recovery line, and every candle that closed meanwhile is replayed as a
+    digest (check_ema reads CATCH_UP), never as live alerts."""
+    if _link["blind"] and _link["ever_up"] and _link["since"] is not None:
+        log.info("MT5 reconnected after %ds (%d attempts)", round(_mono() - _link["since"]), _link["attempts"])
+        window = (_link["since_srv"], signals.server_now())
+        for sym in C.enabled_symbols():
+            for tf in C.TIMEFRAMES:
+                CATCH_UP[(sym, tf)] = window
+    _link.update(since=None, since_srv=None, attempts=0, next_try=0.0, blind=False, ever_up=True)
+
+
+def reset_link():
+    """Forget any outage in progress (tests; a fresh process starts this way)."""
+    _link.update(since=None, since_srv=None, attempts=0, next_try=0.0, blind=False, ever_up=False)
+    CATCH_UP.clear()
+
+
+def reconnect_wait() -> float:
+    """How long the loop sleeps while the feed is down: poll terminal_info() every RECONNECT_POLL_SECONDS in the
+    grace window, else wake for the next initialize attempt."""
+    if _link["since"] is None:
+        return float(C.POLL_SECONDS)
+    left = _link["next_try"] - _mono()
+    if _link["attempts"] == 0:                                     # grace window: the terminal may come back any second
+        left = min(left, C.RECONNECT_POLL_SECONDS)
+    return float(max(0.5, left))
 
 
 def ensure_mt5() -> str | None:
-    """None when the feed is healthy, else the reason (so the loop can tell you it is blind)."""
+    """None when the feed is healthy, else the reason (so the loop can tell you it is blind).
+    Link lost (terminal attached, connected == False): no initialize() for RECONNECT_GRACE_SECONDS, the terminal
+    reconnects by itself. Terminal gone or other problem: initialize at once. Either way failed attempts back off
+    RECONNECT_BACKOFF and are WARNINGs; the ERROR + Discord card come from report_blind after BLIND_NOTICE_SECONDS."""
     global _stale_loops
     problem = signals.health()
     if problem is None:
         _stale_loops = 0
+        _link_up()
         return None
     if problem.startswith(KEEP_CONNECTION):                        # quiet market, or the clock is still being measured:
         _stale_loops += 1                                          # reconnecting cannot help, so keep the connection
         if _stale_loops % 30:                                      # and only re-initialise every ~30th look
             return problem
-    elif mt5.terminal_info() is not None:                             # was connected -> it's a real problem
-        log.warning("MT5 health: %s — reconnecting", problem)
-    mt5.shutdown()
-    if mt5.initialize():
-        for sym in C.enabled_symbols():                            # disabled symbols are never touched
-            mt5.symbol_select(C.broker_symbol(sym), True)
-        signals.sync_server_offset()
-        acc = mt5.account_info()
-        store.context["account_login"] = getattr(acc, "login", None)
-        log.info("MT5 connected (server time %s)", signals.offset_text())
+        err = _connect()
+        if err:
+            log.warning(err)
+            return err
         return signals.health()
-    err = f"MT5 init failed: {mt5.last_error()}"
-    log.error(err)
-    return err
+    problem = _outage(problem)
+    if problem is not None and _link["since"] is not None:
+        _link["blind"] = True                                      # the loop now knows: report the recovery later
+    return problem
+
+
+def _outage(problem: str) -> str | None:
+    now = _mono()
+    if _link["since"] is None:                                     # a new outage
+        _link.update(since=now, since_srv=signals.server_now(), attempts=0, next_try=now)
+        if problem == signals.LINK_LOST:
+            _link["next_try"] = now + C.RECONNECT_GRACE_SECONDS
+            log.warning("MT5: %s — waiting up to %d s for the terminal to reconnect by itself",
+                        problem, C.RECONNECT_GRACE_SECONDS)
+            return problem
+    if now < _link["next_try"]:
+        return problem                                             # grace window / backoff: terminal_info() only
+    _link["attempts"] += 1
+    err = _connect()
+    if err is None:                                                # the link is back (a stale tick or a clock still
+        _link_up()                                                 # being measured is the feed's business, not ours)
+        return signals.health()
+    problem = err
+    wait = C.RECONNECT_BACKOFF[min(_link["attempts"], len(C.RECONNECT_BACKOFF)) - 1]
+    _link["next_try"] = _mono() + wait
+    log.warning("MT5 reconnect attempt %d failed: %s — next try in %d s", _link["attempts"], problem, wait)
+    return problem
 
 
 # ---- "am I blind?" bookkeeping (in memory: a restart re-announces itself anyway) ----
@@ -128,13 +198,14 @@ _blind = {"since": None, "notified": False}
 
 
 def report_blind(problem: str):
-    now = time.time()
+    now = _mono()
     if _blind["since"] is None:
         _blind["since"] = now
     limit = C.STALE_NOTICE_SECONDS if problem.startswith("stale tick") else C.BLIND_NOTICE_SECONDS
     if not _blind["notified"] and now - _blind["since"] >= limit:
         _blind["notified"] = True
         mins = (now - _blind["since"]) / 60
+        log.error("MT5 feed still down after %d s: %s", round(now - _blind["since"]), problem)
         notifier.deliver(state, notifier.warn("bot is BLIND — no alerts until this clears",
                                               f"{problem}\nSince {mins:.0f} min. Check the MT5 terminal / internet.",
                                               ping=True, symbol=syms(), kind="BLIND"))
@@ -142,7 +213,7 @@ def report_blind(problem: str):
 
 def report_recovered():
     if _blind["notified"]:
-        mins = (time.time() - _blind["since"]) / 60
+        mins = (_mono() - _blind["since"]) / 60
         notifier.deliver(state, notifier.info("✅ feed is back", f"Was blind {mins:.0f} min — missed candles are being replayed.",
                                               symbol=syms(), kind="RECOVERED"))
     _blind["since"], _blind["notified"] = None, False
@@ -193,16 +264,72 @@ def alive_ping():
         state.mark(key)
 
 
-def next_sleep() -> float:
-    """Sleep POLL_SECONDS, but wake exactly BAR_CLOSE_DELAY seconds after the next candle close."""
+def _secs_of_day() -> float:
     now = signals.server_now()
-    secs = (now - now.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
-    waits = [float(C.POLL_SECONDS)]
+    return (now - now.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
+
+
+def next_sleep() -> float:
+    """Sleep POLL_SECONDS, but wake FAST_POLL_LEAD s before the next candle close (the fast window starts there)."""
+    # (a pass that ends inside a window, e.g. the candle had no tick yet, falls back to the normal rhythm)
+    secs = _secs_of_day()
     for tf in C.TIMEFRAMES:
         to_close = C.BAR_MINUTES[tf] * 60 - secs % (C.BAR_MINUTES[tf] * 60)
-        if to_close <= C.POLL_SECONDS:                             # a candle closes before the next poll: land right on it
-            return max(1.0, to_close + C.BAR_CLOSE_DELAY)
-    return max(1.0, min(waits))
+        if to_close - C.FAST_POLL_LEAD <= C.POLL_SECONDS:          # a candle closes before the next poll
+            return max(0.05, to_close - C.FAST_POLL_LEAD)
+    return float(C.POLL_SECONDS)
+
+
+def _window_close(tf: str):
+    """Server time of the candle close whose fast window we are in (it may still be up to FAST_POLL_LEAD s
+    ahead), or None outside every window."""
+    period = C.BAR_MINUTES[tf] * 60
+    secs = _secs_of_day()
+    since_close = (secs + C.FAST_POLL_LEAD) % period - C.FAST_POLL_LEAD     # -LEAD .. period-LEAD
+    if since_close >= C.FAST_POLL_WINDOW - C.FAST_POLL_LEAD:
+        return None
+    midnight = signals.server_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(seconds=round(secs - since_close))          # closes fall on whole seconds
+
+
+def in_close_window() -> bool:
+    """Inside the FAST_POLL_WINDOW around a candle close of any configured timeframe."""
+    return any(_window_close(tf) is not None for tf in C.TIMEFRAMES)
+
+
+def _closed_bar_ready(symbol: str, close) -> bool:
+    """The candle that closes at `close` is complete once the broker's first tick of the NEXT candle is in: MT5
+    stamps ticks with the broker's clock, so no late tick of the closed candle can still be on its way."""
+    tick = mt5.symbol_info_tick(C.broker_symbol(symbol))
+    return tick is not None and signals.stamp_to_dt(tick.time) >= close
+
+
+def _bar_done(symbol: str, tf: str, close) -> bool:
+    """The checkpoint already holds the candle that closes at `close`."""
+    last = state.last_bar(tf, symbol)
+    return bool(last) and pd.Timestamp(last).to_pydatetime() >= close - timedelta(minutes=C.BAR_MINUTES[tf])
+
+
+def check_candles():
+    """Every enabled symbol x timeframe. Inside the window around a candle close: re-check every
+    FAST_POLL_SECONDS until each has that candle (or the window ends; the next normal poll then takes over)."""
+    closes = {tf: _window_close(tf) for tf in C.TIMEFRAMES}
+    todo = [(sym, tf) for sym in C.enabled_symbols() for tf in C.TIMEFRAMES]
+    for sym, tf in [p for p in todo if closes[p[1]] is None]:     # no close nearby: one normal look
+        run_stage(f"candles {sym} {tf}", check_ema, tf, sym)
+        todo.remove((sym, tf))
+    for _ in range(int(C.FAST_POLL_WINDOW / C.FAST_POLL_SECONDS) + 1):
+        for sym, tf in list(todo):
+            close = closes[tf]
+            if not _bar_done(sym, tf, close):
+                if not _closed_bar_ready(sym, close):
+                    continue                                       # no tick of the next candle yet: look again soon
+                run_stage(f"candles {sym} {tf}", check_ema, tf, sym)
+            if _bar_done(sym, tf, close):
+                todo.remove((sym, tf))
+        if not todo or not in_close_window():
+            return
+        time.sleep(C.FAST_POLL_SECONDS)
 
 
 def check_ema(tf: str, symbol: str | None = None):
@@ -210,6 +337,7 @@ def check_ema(tf: str, symbol: str | None = None):
     symbol = symbol or C.SYMBOL
     if not C.is_enabled(symbol):
         return                                                     # disabled: no data reads, no alerts
+    catch_up = CATCH_UP.pop((symbol, tf), None)                    # first look after an MT5 outage
     last_done = state.last_bar(tf, symbol)
     since = pd.Timestamp(last_done).to_pydatetime() if last_done else None
     if since and signals.server_now() < since + timedelta(minutes=2 * C.BAR_MINUTES[tf]):
@@ -220,6 +348,10 @@ def check_ema(tf: str, symbol: str | None = None):
     newest = df["time"].iloc[-1]
     if since and since >= newest.to_pydatetime():
         return                                                     # nothing new since checkpoint
+    t_detect = time.time()
+    lag = signals.utc_now().timestamp() - _close_utc(newest, tf)
+    log.info("%s %s candle %s closed: detected %s (+%.2fs after the close)", symbol, tf,
+             f"{newest:%H:%M}", _hms(t_detect), lag)
 
     todo = int((df["time"] > since).sum()) if since else C.DEFAULT_LOOKBACK_BARS + 1
     todo = min(todo, len(df) - C.EMA_TREND, REPLAY_CAP)
@@ -245,11 +377,12 @@ def check_ema(tf: str, symbol: str | None = None):
     for bar_time, e in candle_events(df, todo, tf, symbol, lab):
         bar_close = bar_time.to_pydatetime() + timedelta(minutes=bar_min)
         is_missed = (now_srv - bar_close).total_seconds() > C.MISSED_GRACE_SECONDS
+        closed_blind = bool(catch_up) and catch_up[0] <= bar_close <= catch_up[1]   # closed while MT5 was down
         key = f"{symbol}:{tf}:{e['type']}:{e['dir']}:{e.get('episode', str(bar_time))}"
         if state.seen(key) or key in seen_now:
             continue
         seen_now.add(key)
-        (missed if is_missed and todo > 2 else live).append((key, bar_time, e))
+        (missed if (is_missed and todo > 2) or closed_blind else live).append((key, bar_time, e))
     missed_bars = sum((now_srv - (t.to_pydatetime() + timedelta(minutes=bar_min))).total_seconds() > C.MISSED_GRACE_SECONDS
                       for t in df["time"][df["time"] >= eval_from])
 
@@ -265,31 +398,36 @@ def check_ema(tf: str, symbol: str | None = None):
                                                        missed_bars, signals.ema_status(df, price), symbol=symbol))
         for key, _, _ in missed:                                   # digest is sent or in the retry queue -> safe to mark
             state.mark(key)
-    elif missed_bars and todo > 2:
+    elif missed_bars and (todo > 2 or catch_up):
         log.info("%s %s: %d missed bars, no signals in them", symbol, tf, missed_bars)
 
-    charts = {}                                                    # one picture per candle, shared by its events
+    # The text card goes out FIRST; dedupe keys (state file) right after it; then the records (queued, written and
+    # uploaded on their own threads) and only then the chart, as a second message: no picture ever delays an alert.
+    t_signal = time.time()
+    charts, recs = [], []                                          # one picture per candle, shared by its events
     for bt, group in _fold_quiet(live):
+        pic = None
         for key, e, folded in group:
-            image = None
-            if C.CHART_ENABLED and e["type"] in notifier.PINGS:
-                if bt not in charts:
-                    charts[bt] = chart.render(df[df["time"] <= bt], tf, notifier.event_caption(tf, bt, e, symbol),
-                                              signals.to_ist, mark_last=e["dir"] if e["dir"] in ("BULL", "BEAR") else None,
-                                              symbol=symbol)
-                image = charts[bt]
-            for _, fe in folded:
-                record_event(symbol, tf, bt, fe)
-            record_event(symbol, tf, bt, e)
-            msg = format_live(tf, bt, e, symbol, missed=(todo <= 2 and bt != newest), image=image)
+            msg = format_live(tf, bt, e, symbol, missed=(todo <= 2 and bt != newest))
             if folded:
                 msg["fields"].append(("Also on this candle", " · ".join(
                     f"{notifier.TITLES.get(fe['type'], fe['type'])} {notifier.ARROW.get(fe['dir'], fe['dir'])}"
                     for _, fe in folded), False))
-            notifier.deliver(state, msg, key=key)
+            timing = {}
+            notifier.deliver(state, msg, key=key, timing=timing)
+            log_latency(symbol, tf, bt, e, t_detect, t_signal, timing)
             for fk, _ in folded:
                 state.mark(fk)
             state.mark(key)
+            recs += [(bt, fe) for _, fe in folded] + [(bt, e)]
+            if pic is None and C.CHART_ENABLED and e["type"] in notifier.PINGS:
+                pic = (bt, e, notifier.channel_of(msg))
+        if pic:
+            charts.append(pic)
+    for bt, e in recs:
+        record_event(symbol, tf, bt, e)
+    for bt, e, channel in charts:
+        send_chart(df, tf, bt, e, symbol, channel)
     run_stage(f"bar records {symbol}", record_bars, symbol, tf, df, LAST_BARS.get(symbol, lab and labels.prepare(df)),
               since + timedelta(seconds=1) if since else df["time"].iloc[len(df) - todo])
     state.checkpoint(tf, newest, symbol)
@@ -440,6 +578,39 @@ def record_event(symbol, tf, bt, e):
     store.record("event", {"tf": tf, "bar_time": str(bt), "label": e["type"], "side": e["dir"], "tag": e.get("tag"),
                            "price": float(e["price"]), "gap": e.get("gap"), "atr": e.get("atr"),
                            "pair": e.get("pair")}, symbol=symbol)
+
+
+def _close_utc(bar_time, tf) -> float:
+    """Real UTC timestamp of a candle's close (bar_time = its open, MT5 server time)."""
+    close_srv = pd.Timestamp(bar_time).to_pydatetime() + timedelta(minutes=C.BAR_MINUTES[tf])
+    return (close_srv - signals._server_offset).replace(tzinfo=timezone.utc).timestamp()
+
+
+def _hms(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M:%S.%f")[:-3] + "Z"
+
+
+def log_latency(symbol, tf, bt, e, t_detect, t_signal, timing):
+    """One line per alert: bar close detected -> signal computed -> webhook sent -> each webhook's response."""
+    sent = timing.get("sent")
+    resp = " · ".join(f"{n} {_hms(t)} (+{t - sent:.2f}s)" for n, t in timing.get("resp", {}).items()) if sent else "-"
+    log.info("latency %s %s %s %s: detected %s · signal %s (+%.3fs) · sent %s (+%.3fs) · response %s",
+             symbol, tf, f"{bt:%H:%M}", e["type"], _hms(t_detect), _hms(t_signal), t_signal - t_detect,
+             _hms(sent) if sent else "-", (sent - t_detect) if sent else 0.0, resp)
+
+
+def send_chart(df, tf, bt, e, symbol, channel):
+    """The chart of an alert's candle, as its own Discord message right after the text card. Best effort: a
+    failed render or post is logged and never retried, the alert itself has already gone out."""
+    try:
+        caption = notifier.event_caption(tf, bt, e, symbol)
+        image = chart.render(df[df["time"] <= bt], tf, caption, signals.to_ist,
+                             mark_last=e["dir"] if e["dir"] in ("BULL", "BEAR") else None, symbol=symbol)
+        if image:
+            notifier.send(notifier.card(f"{caption} · 📈 chart", color=notifier._color(e), image=image, channel=channel,
+                                        symbol=symbol, kind="CHART"), only=["Discord"])
+    except Exception:
+        log.exception("%s %s chart for %s failed (the alert was sent)", symbol, tf, bt)
 
 
 def _symbol_arg(req: dict) -> tuple[str | None, str | None]:
@@ -762,9 +933,7 @@ def main():
             if problem:
                 report_blind(problem)
                 run_stage("retry queue", notifier.flush_pending, state)
-                wait = C.POLL_SECONDS if problem.startswith(KEEP_CONNECTION) else backoff
-                if wait == backoff:
-                    backoff = min(backoff * 2, 60)                 # never more than 1 min from noticing the feed is back
+                wait = C.POLL_SECONDS if problem.startswith(KEEP_CONNECTION) else reconnect_wait()
                 heartbeat(wait); time.sleep(wait); continue
             backoff = 5
             report_recovered()
@@ -773,9 +942,7 @@ def main():
             note = signals.pop_clock_note()
             if note:
                 notifier.deliver(state, notifier.warn("MT5 clock corrected", note, symbol=syms()))
-            for sym in C.enabled_symbols():                        # signals first: nothing may delay a fresh candle
-                for tf in C.TIMEFRAMES:
-                    run_stage(f"candles {sym} {tf}", check_ema, tf, sym)
+            check_candles()                                        # signals first: nothing may delay a fresh candle
             run_stage("commands", process_commands)
             run_stage("positions", positions.track, state, LABELS)   # opened / closed / MAX POINT giveback
             run_stage("monitor", refresh_monitors)

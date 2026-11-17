@@ -117,7 +117,12 @@ DIGEST_MAX_LINES = 20           # missed events after an outage are sent as ONE 
 NEW_ALERT_TICK_SECONDS = 180    # a new price alert is checked on exact ticks for this long, then on M1 bars
 PRICE_HISTORY_RETRIES = 3       # loops to retry fetching M1 history before reporting the gap and moving on
 POLL_SECONDS = 10               # price alerts / health are checked this often
-BAR_CLOSE_DELAY = 3             # seconds after a candle closes before reading it (the loop wakes exactly then)
+# Around each candle close the loop polls fast instead of sleeping POLL_SECONDS: from FAST_POLL_LEAD s before the
+# close to FAST_POLL_WINDOW - FAST_POLL_LEAD s after it, every FAST_POLL_SECONDS. The closed candle is read as soon
+# as the broker's first tick of the next candle has arrived (so no tick of the closed one can still be missing).
+FAST_POLL_SECONDS = 0.15
+FAST_POLL_WINDOW = 5.0
+FAST_POLL_LEAD = 0.5
 TIMEZONE = "Asia/Kolkata"       # weekend pause + IST display
 # MT5 clock = how far MT5's timestamps are from real UTC. This is only the STARTING value: the bot measures the
 # real offset from the live feed and uses that if it differs (and tells you). SERVER_TZ follows daylight saving
@@ -132,7 +137,13 @@ PAUSE_START = (5, "04:00")      # Saturday 04:00 IST
 PAUSE_END = (0, "03:25")        # Monday 03:25 IST
 
 # "Am I blind?" notices
-BLIND_NOTICE_SECONDS = 180      # terminal/symbol/clock problem for this long -> one warning
+BLIND_NOTICE_SECONDS = 120      # terminal/symbol/clock problem for this long -> one ERROR + one warning card
+# MT5 link lost (terminal_info().connected False): the terminal reconnects to the broker by itself, so the bot only
+# polls terminal_info() every RECONNECT_POLL_SECONDS for RECONNECT_GRACE_SECONDS. Only then shutdown + initialize,
+# retried after RECONNECT_BACKOFF seconds (the last value repeats).
+RECONNECT_GRACE_SECONDS = 30
+RECONNECT_POLL_SECONDS = 2
+RECONNECT_BACKOFF = (5, 10, 20, 40)
 STALE_NOTICE_SECONDS = 75 * 60  # no new tick for this long (longer than the daily break) -> one warning
 ALIVE_PING_IST = "08:00"        # one "alive" card per day at this IST time ("" = off)
 START_NOTICE_COOLDOWN = 600     # at most one "bot online" card per this many seconds

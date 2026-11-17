@@ -10,6 +10,16 @@ import store
 
 log = logging.getLogger("notifier")
 _last_fail_notice = {}
+_session = None                                                  # ONE keep-alive session: no new TLS handshake per alert
+_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="webhook")
+
+
+def _http():
+    """The shared requests.Session (connection pool, thread-safe for these posts)."""
+    global _session
+    if _session is None:
+        _session = requests.Session() if hasattr(requests, "Session") else requests
+    return _session
 
 
 def load_json(path: str, default: dict) -> tuple[dict, str | None]:
@@ -166,10 +176,10 @@ def _post(url, payload, name, attempts: int = 3) -> str:
     for attempt in range(attempts):
         try:
             if data:
-                r = requests.post(url, data={"payload_json": json.dumps(payload)},
+                r = _http().post(url, data={"payload_json": json.dumps(payload)},
                                   files={"files[0]": ("chart.png", data, "image/png")}, timeout=(5, 20))
             else:
-                r = requests.post(url, json=payload, timeout=(5, 10))
+                r = _http().post(url, json=payload, timeout=(5, 10))
             if r.status_code < 300:
                 return "ok"
             if r.status_code == 429:
@@ -264,24 +274,32 @@ def _logfile(msg, key: str | None = None):
         log.exception("alerts.log write failed")
 
 
-def send(msg, only: list[str] | None = None, key: str | None = None, attempts: int = 2) -> dict:
+def send(msg, only: list[str] | None = None, key: str | None = None, attempts: int = 2,
+         timing: dict | None = None) -> dict:
     """Post a str or card to configured services (or just `only`) IN PARALLEL, so one slow or dead service
-    never delays the others. Two quick tries live; anything still failing goes to the retry queue. Returns {service: 'ok'|'failed'|'not_configured'}."""
-    log.info("ALERT %s", plain(msg).replace("\n", " | "))
-    if only is None:
-        _logfile(msg, key)
+    never delays the others. Two quick tries live; anything still failing goes to the retry queue. Returns {service: 'ok'|'failed'|'not_configured'}.
+    The webhooks go out first; alerts.log and the record follow. timing (optional): filled with "sent" (epoch s,
+    just before posting) and "resp" {service: epoch s of its answer}."""
     chan = channel_of(msg)
     names = [n for n in _services_for(msg) if only is None or n in only]
-    if not names:
-        return {}
+    timing = timing if timing is not None else {}
+    resp = timing.setdefault("resp", {})
 
     def one(n):
         if n == "Discord" and interactive(msg):
-            return outbox_put(msg)                               # buttons / edit-in-place: the bot client posts it
-        return _post(_url(n, chan), SERVICES[n][1](msg), n, attempts)
-    with ThreadPoolExecutor(max_workers=len(names)) as ex:
-        results = list(ex.map(one, names))
+            out = outbox_put(msg)                                # buttons / edit-in-place: the bot client posts it
+        else:
+            out = _post(_url(n, chan), SERVICES[n][1](msg), n, attempts)
+        resp[n] = time.time()
+        return out
+    timing["sent"] = time.time()
+    results = list(_pool.map(one, names)) if names else []
     status = dict(zip(names, results))
+    log.info("ALERT %s", plain(msg).replace("\n", " | "))
+    if only is None:
+        _logfile(msg, key)
+    if not names:
+        return {}
     if only is None:
         store.record("alert", {"channel": chan, "alert_kind": msg.get("kind", "") if isinstance(msg, dict) else "text",
                                "title": msg.get("title") if isinstance(msg, dict) else str(msg)[:200],
@@ -326,9 +344,9 @@ def flush_pending(state: State):
         state.d["pending"] = still; state.save()
 
 
-def deliver(state: State, msg, key: str | None = None) -> bool:
+def deliver(state: State, msg, key: str | None = None, timing: dict | None = None) -> bool:
     """Send now (str or card); any service that fails gets it queued for retry. True if >=1 delivered."""
-    status = send(msg, key=key)
+    status = send(msg, key=key, timing=timing)
     owed = failed_services(status)
     if owed:
         state.queue(msg, owed)
