@@ -126,6 +126,9 @@ def symbol_problem(broker_name: str) -> str | None:
     return None
 
 
+LINK_LOST = "MT5 terminal has no connection to the broker"   # terminal attached, broker link down: it reconnects itself
+
+
 def health() -> str | None:
     """None if healthy, else a reason. Checks terminal, every ENABLED symbol, and tick freshness (primary symbol;
     the clock is the broker's, shared by all symbols). Disabled symbols are never touched."""
@@ -133,7 +136,7 @@ def health() -> str | None:
     if ti is None:
         return "terminal not connected"
     if not getattr(ti, "connected", True):
-        return "MT5 terminal has no connection to the broker"
+        return LINK_LOST
     for sym in C.enabled_symbols():
         info = mt5.symbol_info(_b(sym))
         if info is None or not info.visible:

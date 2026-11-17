@@ -51,12 +51,12 @@ class V170(Base):
 class Version(V170):
     def test_version_file_and_status(self):
         with open(os.path.join(C.PROJECT_DIR, "VERSION")) as f:
-            self.assertEqual(f.read().strip(), "1.7.1")
-        self.assertEqual(C.VERSION, "1.7.1")
+            self.assertEqual(f.read().strip(), "1.7.2")
+        self.assertEqual(C.VERSION, "1.7.2")
         r = self.json_cmd("status", symbol="XAUUSD")
-        self.assertTrue(r["ok"], r); self.assertIn("v1.7.1", r["text"]); self.assertTrue(r["image"])
+        self.assertTrue(r["ok"], r); self.assertIn("v1.7.2", r["text"]); self.assertTrue(r["image"])
         bot.announce_start()
-        self.assertTrue(any("v1.7.1" in t and t.startswith("XAUUSD") for t in titles(Http.to("discord"))))
+        self.assertTrue(any("v1.7.2" in t and t.startswith("XAUUSD") for t in titles(Http.to("discord"))))
 
 
 class Symbols(V170):
@@ -162,7 +162,8 @@ class LabelAlerts(V170):
         names = " ".join(c["title"] for c in cards)
         for label in ("GAP WIDENING", "WIDE GAP", "GAP PEAKED", "CROSS"):
             self.assertIn(label, names)
-        live = [c for c in cards if "MISSED" not in c["title"] and "online" not in c["title"]]
+        live = [c for c in cards if "MISSED" not in c["title"] and "online" not in c["title"]
+                and "📈 chart" not in c["title"]]                  # the chart follows the card as its own message
         self.assertTrue(all(any(f["name"] == "Market now" for f in c["fields"]) for c in live))
         quiet = {"GAP WIDENING", "PARALLEL RUNNING", "WIDE GAP", "PULLBACK STARTED", "RE-ENTRY"}
         for p in Http.to("slack"):                                # #updates labels never reach Slack on their own
@@ -184,11 +185,11 @@ class Records(V170):
         ev, al = records("event"), records("alert")
         sent_keys = [k for k in bot.state.d["keys"] if k.startswith("XAUUSD:M30:")]
         self.assertEqual(len(ev), len(sent_keys))
-        self.assertEqual(len(al), len(titles(Http.to("discord"))))
+        self.assertEqual(len(al), len([t for t in titles(Http.to("discord")) if "📈 chart" not in t]))
         for r in ev + al:
             for f in ("record_id", "utc_time", "server_time", "version", "account_login", "symbol"):
                 self.assertIn(f, r)
-            self.assertEqual(r["version"], "1.7.1"); self.assertEqual(r["account_login"], 555)
+            self.assertEqual(r["version"], "1.7.2"); self.assertEqual(r["account_login"], 555)
         self.assertEqual(len({r["record_id"] for r in ev + al}), len(ev + al))
         n = len(records("event"))
         bot.state = notifier.State(); bot.check_ema("M30")          # restart: nothing re-sent, nothing re-recorded

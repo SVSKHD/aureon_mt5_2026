@@ -68,6 +68,8 @@ def titles(payloads):
 class Base(unittest.TestCase):
     def setUp(self):
         p = mock.patch("time.sleep"); p.start(); self.addCleanup(p.stop)
+        self.clock = [1000.0]                                         # bot's monotonic clock (reconnect timing)
+        p = mock.patch.object(bot, "_mono", lambda: self.clock[0]); p.start(); self.addCleanup(p.stop)
         World.reset(); Http.reset()
         C.PLACE_ENABLED, C.PLACE_ALLOW_REAL, C.PLACE_ACCOUNT_LOGINS = True, False, set()
         C.PLACE_MAX_LOT = C.PLACE_MAX_RISK = C.PLACE_MAX_POSITIONS = C.PLACE_DAILY_LOSS_LIMIT = None
@@ -75,7 +77,7 @@ class Base(unittest.TestCase):
             for name in os.listdir(folder):
                 os.remove(os.path.join(folder, name))
         bot.state = notifier.State()
-        bot._blind.update(since=None, notified=False); bot._stale_loops = 0
+        bot._blind.update(since=None, notified=False); bot._stale_loops = 0; bot.reset_link()
         notifier._last_fail_notice.clear()
         C.SERVER_UTC_OFFSET_HOURS, C.SERVER_TZ = None, "Europe/Athens"
         signals._offset_source = "unset"; signals._clock_note = None
@@ -104,10 +106,12 @@ class Signals(Base):
     def test_alert_arrives_seconds_after_candle_close_with_right_times(self):
         bot.check_ema("M30"); Http.reset()
         new = self.run_until_event()
-        self.assertEqual(len(new), 3)                                # Discord + Slack + ntfy, once each
-        card = Http.to("discord")[0]
-        self.assertEqual(card["embeds"][0]["image"]["url"], "attachment://chart.png")
-        self.assertTrue(Http.files[-1].startswith(b"\x89PNG"))        # a real chart picture went with it
+        self.assertEqual(len(new), 4)                                # Discord + Slack + ntfy, once each, + the chart
+        card, pic = Http.to("discord")[0], Http.to("discord")[-1]
+        self.assertNotIn("image", card["embeds"][0])                 # the text card never waits for a picture
+        self.assertEqual(pic["embeds"][0]["image"]["url"], "attachment://chart.png")
+        self.assertIn("📈 chart", pic["embeds"][0]["title"])
+        self.assertTrue(Http.files[-1].startswith(b"\x89PNG"))        # a real chart picture follows as message two
         closed_ist = World.now.astimezone(IST).replace(second=0)
         self.assertIn(f"{closed_ist:%d %b %H:%M} IST", json.dumps(card))
         self.assertEqual(World.now.second, 3)                         # sent on the pass 3 s after the close
@@ -227,7 +231,7 @@ class Clock(Base):
         self.assertEqual(left("2026-11-11 15:00"), 0)
 
     def test_wakes_right_after_the_close(self):
-        self.assertEqual(bot.next_sleep(), 13)                        # 10 s to the close + 3
+        self.assertEqual(bot.next_sleep(), 10 - C.FAST_POLL_LEAD)      # wake when the fast window opens
         World.advance(seconds=-20)
         self.assertEqual(bot.next_sleep(), C.POLL_SECONDS)
 
@@ -268,6 +272,7 @@ class Delivery(Base):
             bot.report_blind(p); bot.report_blind(p)
             self.assertEqual(sum("BLIND" in t for t in titles(Http.to("discord"))), 1)
             World.connected = True
+            self.clock[0] += C.RECONNECT_BACKOFF[0]                   # next initialize attempt is due
             self.assertIsNone(bot.ensure_mt5()); bot.report_recovered(); bot.report_recovered()
             self.assertEqual(sum("feed is back" in t for t in titles(Http.to("discord"))), 1)
 

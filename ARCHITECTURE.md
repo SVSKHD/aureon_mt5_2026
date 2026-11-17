@@ -1,4 +1,4 @@
-# Aureon — v1.7.1
+# Aureon — v1.7.2
 
 **What it is:** a labelled trade assistant for XAUUSD on M30 (XAGUSD built in, switched off by default). It reads
 closed candles from your MT5 terminal, labels the whole life of each EMA 8/32 trend, tracks your positions, trails
@@ -65,13 +65,14 @@ Market Watch. Every state key, dedupe key, retry entry, record and title is per 
 ## The loop
 
 ```
-every pass (10 s, and exactly 3 s after each candle close); every stage is wrapped: one failing stage is
-reported (rate-limited) and the others still run
+every pass (10 s; around each candle close a 150 ms poll, see "On time"); every stage is wrapped: one failing
+stage is reported (rate-limited) and the others still run
  ├─ notices                watchdog / updater messages (updated, skipped, rolled back, crashed)
  ├─ weekend_pause()        Sat 04:00 → Mon 03:25 IST
- ├─ ensure_mt5()           terminal? broker link? fresh tick? clock right?   → else "BLIND" notice
+ ├─ ensure_mt5()           terminal? broker link? fresh tick? clock right?   → else reconnect (see below), "BLIND"
  ├─ warm start (once)      labels rebuilt from candles, positions re-read, pending TSL step applied
- ├─ check_ema(symbol)      new closed candle → detect() + labels → dedupe → chart → send
+ ├─ check_ema(symbol)      new closed candle → detect() + labels → dedupe → TEXT CARD → dedupe keys → records
+ │                         → chart as a second Discord message
  │                         → positions.on_candle (TSL, in-trade alerts) → monitor refresh
  ├─ process_commands()     slash commands and buttons waiting in the inbox (the loop wakes at once for these)
  ├─ positions.track()      opened / closed / MAX POINT giveback
@@ -161,8 +162,20 @@ restart; they go through the same signed inbox as the commands.
 - **Restarts:** labels, pullbacks and the TSL are recomputed from closed candles, so a restart (or an update) in the
   middle of a pullback still fires the pending step; monitor state and position memory are in the state file.
 
-- **On time:** the loop wakes 3 s after each close; history is not pulled between closes; services are posted in
-  parallel; old retries cannot delay a fresh alert.
+- **On time (1.7.2):** from 0.5 s before each candle close to 4.5 s after it the loop polls every 150 ms
+  (`FAST_POLL_*` in config.py) and reads the closed candle as soon as the broker's first tick of the next candle is
+  in (so no late tick of the closed one can be missing); a candle with no such tick in the window is read on the next
+  normal 10 s poll. The text card is posted first; dedupe keys, records (queued; written and uploaded on their own
+  threads, never on the alert path) and the chart follow, the chart as its own Discord message. All webhooks share
+  one keep-alive HTTP session (no TLS handshake per alert) and are posted in parallel; old retries cannot delay a
+  fresh alert. Each alert logs one `latency ...` line: candle close detected, signal computed, webhook sent, each
+  webhook's response.
+- **MT5 reconnect (1.7.2):** broker link lost (`terminal_info().connected == False`): the terminal reconnects by
+  itself, so for 30 s the bot only polls `terminal_info()` every 2 s and never calls `initialize()`. Then (or at once
+  when the terminal itself is gone) shutdown + initialize, retried after 5 / 10 / 20 / 40 s (`RECONNECT_*`). Failed
+  attempts are WARNINGs; still down after 2 min = one ERROR and one BLIND card. Recovery logs one line,
+  `MT5 reconnected after <N>s (<k> attempts)`; candles that closed while the link was down are replayed as one
+  digest, never as live pings.
 - **Right clock:** the MT5 time offset starts from config (`SERVER_TZ`, default Europe/Athens, follows DST) and is
   then *measured from live ticks*. If the feed disagrees (different DST dates, a broker that stamps plain UTC,
   wrong config) the bot switches to the feed within ~40 s and tells you, without reconnecting. A stale tick is
@@ -170,7 +183,7 @@ restart; they go through the same signed inbox as the commands.
 - **Right EMA 200:** 1000 warm-up candles, so it equals the MT5 chart.
 - **Nothing lost:** per-timeframe checkpoint; after an outage everything since the checkpoint is replayed as one
   digest. A message is marked sent only after it was delivered or queued on disk.
-- **No silent failure:** BLIND notice after 3 min (terminal / broker link / clock) or 75 min (no ticks).
+- **No silent failure:** BLIND notice after 2 min (terminal / broker link / clock) or 75 min (no ticks).
 - **State safety:** atomic JSON writes with `.bak`; a corrupt file falls back to `.bak`, then to keys rebuilt from
   the alert log.
 - **Price alerts:** an alert only sees prices from after it was created — exact ticks for its first 3 minutes,
