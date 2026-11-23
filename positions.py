@@ -14,7 +14,7 @@ import logging, time
 from datetime import datetime, timedelta
 import MetaTrader5 as mt5
 import config as C
-import signals, notifier, store, trader, labels
+import signals, notifier, store, trader, labels, trade_mgmt
 
 log = logging.getLogger("positions")
 REASONS = {0: "manual (terminal)", 1: "manual (mobile)", 2: "manual (web)", 3: "expert/script", 4: "SL hit",
@@ -315,17 +315,33 @@ def _trail(state, pos, symbol, bars, lab, rec, newest) -> list | None:
     new_sl = round(step["sl"], digits)
     trigger = f"close beyond {step['pre_extreme']:.2f} after RE-ENTRY · pullback extreme {step['pullback_extreme']:.2f}"
     mode = tsl_mode()
+    tok = trade_mgmt.token()                                 # the management generation this step is decided under
     if mode == "suggest":
         state.mark(key)
         store.record("sl_change", {"ticket": pos.ticket, "old_sl": cur_sl, "new_sl": new_sl, "trigger": trigger,
                                    "mode": "suggest", "verified": False}, symbol=symbol)
+        fields = [("Ticket", str(pos.ticket)), ("SL now", f"{cur_sl:.2f}" if cur_sl else "none"),
+                  ("Suggested SL", f"{new_sl:.{digits}f}"), ("Trigger", trigger, False)]
+        if not trade_mgmt.enabled():
+            fields.append(("Trade management", "OFF — Apply is refused. Move the stop in MT5 if you want it.", False))
         _send(state, notifier.info("🔒 TSL STEP suggested", symbol=symbol, channel="positions", kind="TSL_SUGGEST",
-                                   fields=[("Ticket", str(pos.ticket)), ("SL now", f"{cur_sl:.2f}" if cur_sl else "none"),
-                                           ("Suggested SL", f"{new_sl:.{digits}f}"), ("Trigger", trigger, False)],
-                                   buttons=[notifier.button("Apply", "apply", pos.ticket, new_sl, style="primary")]))
+                                   fields=fields,
+                                   buttons=[notifier.button("Apply", "apply", pos.ticket, new_sl, tok, style="primary")]))
+        return None
+    blocked = trade_mgmt.check(tok)
+    if blocked:                                              # OFF: report once, invalidate this step, touch nothing
+        state.mark(key)
+        store.record("sl_change", {"ticket": pos.ticket, "old_sl": cur_sl, "new_sl": new_sl, "trigger": trigger,
+                                   "mode": "blocked", "verified": False, "detail": blocked}, symbol=symbol)
+        _send(state, notifier.info("⏸️ TSL step NOT applied — trade management is OFF", symbol=symbol,
+                                   channel="positions", kind="TSL_BLOCKED",
+                                   fields=[("Ticket", str(pos.ticket)), ("SL stays", f"{cur_sl:.2f}" if cur_sl else "none"),
+                                           ("Step would be", f"{new_sl:.{digits}f}"), ("Trigger", trigger, False),
+                                           ("Why", blocked + ". The broker-side SL/TP are unchanged; this step will "
+                                                   "not be applied later.", False)]))
         return None
     state.mark(key)                                          # claimed before sending: a crash cannot repeat it
-    res = trader.modify_sl(pos.ticket, new_sl, why="tsl")
+    res = trader.modify_sl(pos.ticket, new_sl, why="tsl", token=tok)
     store.record("sl_change", {"ticket": pos.ticket, "old_sl": cur_sl, "new_sl": new_sl, "trigger": trigger,
                                "mode": "auto", "verified": res["verified"], "detail": res["text"]}, symbol=symbol)
     if not res["ok"]:
@@ -351,7 +367,13 @@ def apply(state, req: dict) -> dict:
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "text": "Apply needs a ticket and a stop level."}
     rec = _book(state).get(str(ticket))
-    res = trader.modify_sl(ticket, sl, why="tsl apply")
+    blocked = trade_mgmt.check(req.get("gen"))               # OFF, or a suggestion from before the last switch
+    if blocked:
+        store.record("sl_change", {"ticket": ticket, "old_sl": None, "new_sl": sl, "trigger": "Apply button",
+                                   "mode": "blocked", "verified": False, "detail": blocked},
+                     symbol=rec["symbol"] if rec else None)
+        return {"ok": False, "text": f"❌ NOT applied — {blocked}."}
+    res = trader.modify_sl(ticket, sl, why="tsl apply", token=req.get("gen"))
     store.record("sl_change", {"ticket": ticket, "old_sl": res["old"], "new_sl": res["new"], "trigger": "Apply button",
                                "mode": "suggest", "verified": res["verified"], "detail": res["text"]},
                  symbol=rec["symbol"] if rec else None)
@@ -422,7 +444,8 @@ def report(state, labs: dict, bars_of=None) -> dict:
             + f"Now {price:.2f} · P/L {pts:+.2f} pts / {money:+,.2f} {cur} · swap {getattr(pos, 'swap', 0):+,.2f}\n"
             + f"SL {sl_txt} · TP {tp_txt} · to SL {to_sl}\n")
         if managed:
-            lines[-1] += (f"TSL step {rec.get('steps', 0)} ({tsl_mode()}) · next: {nxt}\n"
+            lines[-1] += (f"TSL step {rec.get('steps', 0)} ({tsl_mode()}"
+                          f"{'' if trade_mgmt.enabled() else ', trade management OFF'}) · next: {nxt}\n"
                           f"Market: {_status(sym, labs) or '-'}")
     today = trader._closed_pnl_today()
     acct = (f"Balance {acc.balance:,.2f} · Equity {acc.equity:,.2f} {cur} · free margin {getattr(acc, 'margin_free', 0):,.2f}"

@@ -275,13 +275,16 @@ def _logfile(msg, key: str | None = None):
 
 
 def send(msg, only: list[str] | None = None, key: str | None = None, attempts: int = 2,
-         timing: dict | None = None) -> dict:
+         timing: dict | None = None, route: list[str] | None = None) -> dict:
     """Post a str or card to configured services (or just `only`) IN PARALLEL, so one slow or dead service
     never delays the others. Two quick tries live; anything still failing goes to the retry queue. Returns {service: 'ok'|'failed'|'not_configured'}.
     The webhooks go out first; alerts.log and the record follow. timing (optional): filled with "sent" (epoch s,
-    just before posting) and "resp" {service: epoch s of its answer}."""
+    just before posting) and "resp" {service: epoch s of its answer}.
+    route (notify.py, intelligent/monitor mode and the retry queue): the exact services to use instead of the
+    standard channel routing."""
     chan = channel_of(msg)
-    names = [n for n in _services_for(msg) if only is None or n in only]
+    names = [n for n in (_services_for(msg) if route is None else [r for r in route if r in SERVICES])
+             if only is None or n in only]
     timing = timing if timing is not None else {}
     resp = timing.setdefault("resp", {})
 
@@ -335,7 +338,7 @@ def flush_pending(state: State):
                 msg = {**msg, "footer": (f"⏳ delayed {age_min:.0f} min · " + msg.get("footer", "")).rstrip(" ·")}
             else:
                 msg = f"⏳ (delayed {age_min:.0f} min)\n{msg}"
-        failed = failed_services(send(msg, only=targets, attempts=1))   # one quick try: never stall the loop
+        failed = failed_services(send(msg, only=targets, attempts=1, route=targets))   # one quick try: never stall the loop
         down.update(failed)
         owed = [s for s in item["to"] if s in failed or s not in targets]
         if owed:
@@ -345,11 +348,28 @@ def flush_pending(state: State):
 
 
 def deliver(state: State, msg, key: str | None = None, timing: dict | None = None) -> bool:
-    """Send now (str or card); any service that fails gets it queued for retry. True if >=1 delivered."""
+    """Send now (str or card); any service that fails gets it queued for retry. True if >=1 delivered (or, in the
+    intelligent / monitor notification modes, durably held for a group, digest or feed card).
+    The notification policy (notify.py) decides first; in standard mode - or if the policy itself fails - this is
+    exactly the delivery of earlier versions, so a policy bug can never lose a notification."""
+    routed = None
+    try:
+        import notify
+        msg = notify.redact(msg)
+        routed = notify.route(state, msg, key, timing)
+    except Exception:
+        log.exception("notification policy failed: standard delivery used for this message")
+    if routed is not None:
+        return routed
     status = send(msg, key=key, timing=timing)
     owed = failed_services(status)
     if owed:
         state.queue(msg, owed)
+    try:
+        import notify
+        notify.audit_standard(msg, key, status)
+    except Exception:
+        log.exception("notification audit failed")
     return any(s == "ok" for s in status.values())
 
 

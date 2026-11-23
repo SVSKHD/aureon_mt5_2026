@@ -14,6 +14,7 @@ import MetaTrader5 as mt5
 import config as C
 import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report, updater
 import uploader
+import notify, trade_mgmt
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -635,7 +636,8 @@ def chart_reply(symbol: str) -> dict:
 
 STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else "",
                       lambda sym: monitor.status_line(state, sym),
-                      lambda sym: uploader.status_line()]
+                      lambda sym: uploader.status_line(),
+                      notify.status_line, trade_mgmt.status_line]
 
 
 def status_reply(symbol: str) -> dict:
@@ -652,7 +654,7 @@ def _bars_of(symbol: str):
 
 
 def _trade_user(req: dict) -> str | None:
-    if req.get("user") not in C.DISCORD_ALLOWED_USER_IDS:
+    if not alerts.may(req.get("user"), None, "trade"):
         return "⛔ NOT done — this user is not in DISCORD_ALLOWED_USER_IDS."
     return None
 
@@ -680,7 +682,26 @@ JSON_COMMANDS: dict = {                                            # name -> han
     "unmonitor": lambda req: _with_symbol(req, lambda s: monitor.stop(state, s)),
     "last_week": lambda req: (_with_symbol(req, lambda s: report.last_week_reply([s])) if req.get("symbol")
                               else report.last_week_reply(C.enabled_symbols())),
+    "notify": lambda req: notify.command(state, req),
+    "notify_mode": lambda req: notify.set_mode(state, req),
+    "trade_management": lambda req: trade_management_cmd(req),
 }
+
+
+def trade_management_cmd(req: dict) -> dict:
+    """/trade_management and the controls card buttons. The bot loop is the only place the value changes."""
+    reply, change = trade_mgmt.handle(req)
+    if change:
+        prev, new, user = change
+        notifier.deliver(state, trade_mgmt.change_card(prev, new, user))   # critical: every mode sends it at once
+        post_controls()
+    return reply
+
+
+def post_controls():
+    """The persistent controls card (Enable / Disable buttons), edited in place. Needs the Discord bot client."""
+    if notifier.BOT_CLIENT["on"]:
+        notifier.send(trade_mgmt.controls_card())
 
 
 def _with_symbol(req: dict, fn) -> dict:
@@ -724,7 +745,7 @@ def _handle_json_command(req: dict) -> dict:
     if cmd in JSON_COMMANDS:
         return JSON_COMMANDS[cmd](req)
     if cmd in ("quote", "place"):
-        if req.get("user") not in C.DISCORD_ALLOWED_USER_IDS:      # checked again here, not only in Discord
+        if not alerts.may(req.get("user"), None, "trade"):          # checked again here, not only in Discord
             log.warning("order command from a user who is not allowed: %r", req.get("user"))
             return {"ok": False, "text": "⛔ NOT placed — this user is not in DISCORD_ALLOWED_USER_IDS."}
         if req.get("symbol"):
@@ -915,23 +936,29 @@ def main():
     if state.problem:
         notifier.deliver(state, notifier.warn("State recovered", state.problem))
     log.info("Data folder: %s", C.DATA_DIR)
+    for note in trade_mgmt.load():                                 # fail closed: any doubt = OFF
+        notifier.deliver(state, notifier.warn("trade management", note, symbol=syms(), kind="WARN"))
+    log.info("Trade management %s · notification mode %s", "ON" if trade_mgmt.enabled() else "OFF", notify.mode())
     chart.prune()
     if uploader.start():                                           # RECORD_SINK=api only; never on this thread
         log.info("Record upload ON to the Assembler API")
     if alerts.start_discord_listener():
         notifier.BOT_CLIENT["on"] = True
         log.info("Discord commands starting: /chart /alert /alerts and /place (%s)", "ON" if C.PLACE_ENABLED else "off")
+        post_controls()
     backoff, announced, last_flush, warmed = 5, False, 0.0, False
     while True:
         try:
             heartbeat(60)                                          # busy: inside a pass
             run_stage("notices", deliver_notices)
             if weekend_pause():
+                run_stage("notify", notify.tick, state)
                 run_stage("retry queue", notifier.flush_pending, state)
                 continue
             problem = ensure_mt5()
             if problem:
                 report_blind(problem)
+                run_stage("notify", notify.tick, state)            # held cards still go out while MT5 is down
                 run_stage("retry queue", notifier.flush_pending, state)
                 wait = C.POLL_SECONDS if problem.startswith(KEEP_CONNECTION) else reconnect_wait()
                 heartbeat(wait); time.sleep(wait); continue
@@ -951,12 +978,13 @@ def main():
             if not announced:
                 run_stage("start card", announce_start); announced = True
             run_stage("alive card", alive_ping)
+            run_stage("notify", notify.tick, state)                # group / digest / feed cards (posted off the loop)
             if state.d["pending"] and time.time() - last_flush >= 30:    # retries after the live work, twice a minute
                 last_flush = time.time(); run_stage("retry queue", notifier.flush_pending, state)
             if updater.restart_requested() and safe_to_restart():  # auto update: stop HERE, at a safe moment
                 log.info("Stopping for an update at a safe moment")
                 store.record("system", {"event": "stop_for_update", "sha": _git_sha()})
-                store.flush(); mt5.shutdown()
+                notify.wait_idle(5); store.flush(); mt5.shutdown()
                 updater.ready_for_restart()
                 return
             wait = next_sleep()

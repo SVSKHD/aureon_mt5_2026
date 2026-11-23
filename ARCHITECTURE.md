@@ -16,7 +16,7 @@ stop-loss (never widening, never removing). All order code is in `trader.py`; `/
 ```
 pip install -r requirements.txt
 put at least one delivery line in .env (see ".env keys" below)
-python -m unittest discover -s tests      # 140 offline tests, no MT5 or internet needed
+python -m unittest discover -s tests      # 210 offline tests, no MT5 or internet needed
 python bot.py --check-time                # during market hours: shows the MT5 clock the bot uses
 python watchdog.py                        # run this, never bot.py directly (it also auto-updates)
 ```
@@ -32,6 +32,10 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | `alerts.py` | price alerts, the signed command inbox, Discord slash commands, buttons, outbox poster | call MT5 or webhooks |
 | `positions.py` | position tracking, stepped TSL decisions, in-trade alerts, MAX POINT, `/positions` | send orders itself |
 | `monitor.py` | the live monitor card per symbol | anything else |
+| `notify_events.py` | the notification event schema and the fixed severity table | decide routing, send |
+| `notify_policy.py` | the pure policy engine (send / group / digest / feed / duplicate) | touch files, network, MT5 |
+| `notify.py` | notification modes, held items, group/digest/feed cards (posted off the loop), audit, `/notify` | call MT5, send orders |
+| `trade_mgmt.py` | the trade management switch (OFF by default): state, nonce confirm, generation check | send orders itself |
 | `weekend.py` | Friday warnings, `/place` block before the close, Monday carry-over | close anything |
 | `report.py` | `/last-week` | write state |
 | `store.py` | `record(kind, payload)` → JSONL sink (database-ready) | be read back by the bot |
@@ -78,7 +82,7 @@ stage is reported (rate-limited) and the others still run
  ├─ positions.track()      opened / closed / MAX POINT giveback
  ├─ monitor, weekend       live card edits; Friday warnings
  ├─ check_price_alerts()   exact ticks for new alerts, M1 bars afterwards
- ├─ start / alive cards, retry queue
+ ├─ start / alive cards, notify.tick (held group/digest/feed cards, posted off the loop), retry queue
  └─ update requested?      stop HERE (inbox empty, nothing in flight) so the watchdog can update
 ```
 
@@ -130,6 +134,8 @@ Setup once: create a bot in the Discord Developer Portal, invite it with the sco
 | `/last-week [symbol]` | previous Mon–Fri: crosses, 200 crosses, positions, P&L, week chart |
 | `/place symbol side lot sl tp [filling]` | shows the exact order → **Confirm** / Cancel → market order |
 | `/alert price [symbol]`, `/alert_remove price [symbol]`, `/alerts` | price alerts |
+| `/notify [status\|prefs\|test]`, `/notify_mode mode` | notification mode, services, preferences, channel test (docs/NOTIFICATIONS.md) |
+| `/trade_management [status\|enable\|disable]` | the bot's own stop moves; enable needs Confirm (docs/NOTIFICATIONS.md) |
 
 Buttons (Monitor, Apply, Close → Confirm, Keep, Refresh) are routed by custom id, so they keep working after a
 restart; they go through the same signed inbox as the commands.
@@ -245,6 +251,12 @@ with the files. `UPDATE_ENABLED=0` turns it off. Positions are never touched by 
 `ASSEMBLER_RECORDS_TOKEN` (bearer token), `RECORD_API_INTERVAL_S` (15), `RECORD_API_BATCH` (500, capped at 500),
 `RECORD_API_TIMEOUT_S` (10), `RECORD_BARS` (1; 0 = no bar records). `validate()` refuses `RECORD_SINK=api` without
 the URL or the token.
+
+## Notification intelligence and trade management (unreleased)
+
+`NOTIFY_MODE` standard (default, unchanged delivery) | intelligent | monitor, and `TRADE_MANAGEMENT_ENABLED`
+(default **false**: the bot no longer moves stops by itself unless this is enabled). Full description, `.env` keys,
+examples and rollback: [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 
 ## Known limits (by design)
 

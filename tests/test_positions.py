@@ -12,7 +12,7 @@ from test_bot import Http, titles, World                 # noqa: E402
 from test_v170 import V170, records                       # noqa: E402
 from test_labels import load, SAMPLE                      # noqa: E402
 import fake_mt5                                           # noqa: E402
-import config as C, signals, notifier, bot, trader, positions, labels, store   # noqa: E402
+import config as C, signals, notifier, bot, trader, positions, labels, store, trade_mgmt   # noqa: E402
 
 GOLDEN_STEPS = [("2026-10-29 18:00", 4044.2), ("2026-10-30 02:30", 4037.4), ("2026-10-30 08:30", 4016.4),
                 ("2026-10-30 14:00", 4004.2)]
@@ -30,6 +30,8 @@ class Pos(V170):
     def setUp(self):
         super().setUp()
         C.SERVER_UTC_OFFSET_HOURS = 0                          # the sample candles are in UTC
+        trade_mgmt.reset(True)                                 # 1.7.3: these tests cover management while it is ON
+        self.addCleanup(trade_mgmt.reset, False)               # (OFF, the default, is covered in test_notify.py)
         World.stamp_offset = timedelta(0)
         signals._server_offset, signals._offset_source = timedelta(0), "pinned"
         self.df = load(SAMPLE)
@@ -176,13 +178,13 @@ class TrailingStop(Pos):
         card = [p for p in Http.to("discord") if "TSL STEP suggested" in p["embeds"][0]["title"]]
         self.assertEqual(len(card), 1)
         self.assertIn("4044.25", json.dumps(card[0]))
-        r = bot.handle_json_command({"cmd": "apply", "ticket": 7001, "sl": 4044.25, "ts": World.now.timestamp(),
+        r = bot.handle_json_command({"cmd": "apply", "gen": trade_mgmt.token(), "ticket": 7001, "sl": 4044.25, "ts": World.now.timestamp(),
                                      "id": "a", "user": 42})
         self.assertTrue(r["ok"], r); self.assertAlmostEqual(World.positions[0].sl, 4044.25)
-        r = bot.handle_json_command({"cmd": "apply", "ticket": 7001, "sl": 4050.0, "ts": World.now.timestamp(),
+        r = bot.handle_json_command({"cmd": "apply", "gen": trade_mgmt.token(), "ticket": 7001, "sl": 4050.0, "ts": World.now.timestamp(),
                                      "id": "b", "user": 42})
         self.assertFalse(r["ok"])                               # looser than now: refused
-        r = bot.handle_json_command({"cmd": "apply", "ticket": 7001, "sl": 4040.0, "ts": World.now.timestamp(),
+        r = bot.handle_json_command({"cmd": "apply", "gen": trade_mgmt.token(), "ticket": 7001, "sl": 4040.0, "ts": World.now.timestamp(),
                                      "id": "c", "user": 99})
         self.assertFalse(r["ok"]); self.assertIn("not in DISCORD_ALLOWED_USER_IDS", r["text"])
 

@@ -278,9 +278,11 @@ def tighter(side: int, new_sl: float, cur_sl: float) -> bool:
     return new_sl > cur_sl if side > 0 else new_sl < cur_sl
 
 
-def modify_sl(ticket: int, new_sl: float, why: str = "tsl") -> dict:
+def modify_sl(ticket: int, new_sl: float, why: str = "tsl", token=None) -> dict:
     """Move a position's stop-loss. ONLY EVER TIGHTENS it, never widens, never removes (TP is kept as it is).
     Checks the broker's stops and freeze levels, sends TRADE_ACTION_SLTP, then reads the position back.
+    A management order: trade management must be ON with the generation `token` the request was decided under
+    (trade_mgmt.check), re-checked immediately before order_send.
     Returns {"ok", "verified", "old", "new", "text"}. Fails closed: if anything cannot be checked, nothing is sent."""
     pos = _position(ticket)
     if pos is None:
@@ -304,6 +306,11 @@ def modify_sl(ticket: int, new_sl: float, why: str = "tsl") -> dict:
                                 f"the price {price:.{info.digits}f}"}
     order = {"action": mt5.TRADE_ACTION_SLTP, "symbol": pos.symbol, "position": ticket, "sl": new_sl,
              "tp": float(pos.tp or 0.0), "magic": C.PLACE_MAGIC, "comment": f"aureon {why}"}
+    import trade_mgmt
+    blocked = trade_mgmt.check(token)                             # LAST check, right before the order goes out
+    if blocked:
+        log.warning("SL move on %s refused: %s", ticket, blocked)
+        return {**base, "text": blocked}
     res = mt5.order_send(order)
     _journal(order, res, "-")
     back = _position(ticket)

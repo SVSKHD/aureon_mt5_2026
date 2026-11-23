@@ -254,16 +254,36 @@ def discord_to_cmd(text: str) -> str | None:
     return " ".join(parts[1:]) if len(parts) > 1 else "list"
 
 
+def may(user_id, channel_id=None, scope: str = "read") -> bool:
+    """THE authorization rule. The Discord thread checks it before a command is sent, and the bot loop checks it
+    again when the signed command runs (channel_id None there = the channel was already checked in Discord).
+      read    the alert channel (if set) and an allowed user (if the list is set)
+      trade   the user must be EXPLICITLY listed in DISCORD_ALLOWED_USER_IDS (orders, Apply, Close, settings)
+      manage  trade + in TRADE_MANAGEMENT_USER_IDS when that list is set (the trade management switch)"""
+    if channel_id is not None and C.DISCORD_ALERT_CHANNEL_ID and channel_id != C.DISCORD_ALERT_CHANNEL_ID:
+        return False
+    if scope == "read":
+        return not C.DISCORD_ALLOWED_USER_IDS or user_id in C.DISCORD_ALLOWED_USER_IDS
+    if not (C.DISCORD_ALLOWED_USER_IDS and user_id in C.DISCORD_ALLOWED_USER_IDS):
+        return False
+    if scope == "manage":
+        return not C.TRADE_MANAGEMENT_USER_IDS or user_id in C.TRADE_MANAGEMENT_USER_IDS
+    return scope == "trade"
+
+
 def authorised(user_id: int, channel_id: int) -> bool:
     """A command is accepted only in the alert channel (if set) and only from an allowed user (if set)."""
-    if C.DISCORD_ALERT_CHANNEL_ID and channel_id != C.DISCORD_ALERT_CHANNEL_ID:
-        return False
-    return not C.DISCORD_ALLOWED_USER_IDS or user_id in C.DISCORD_ALLOWED_USER_IDS
+    return may(user_id, channel_id, "read")
 
 
 def can_trade(user_id: int, channel_id: int) -> bool:
     """Orders are stricter: the user must be explicitly listed in DISCORD_ALLOWED_USER_IDS."""
-    return bool(C.DISCORD_ALLOWED_USER_IDS) and user_id in C.DISCORD_ALLOWED_USER_IDS and authorised(user_id, channel_id)
+    return may(user_id, channel_id, "trade")
+
+
+def can_manage(user_id: int, channel_id: int) -> bool:
+    """The trade management switch: can_trade, and in TRADE_MANAGEMENT_USER_IDS if that list is set."""
+    return may(user_id, channel_id, "manage")
 
 
 EXTRA_COMMANDS: list = [           # (name, description): simple [symbol] commands; the bot loop does the work
@@ -272,6 +292,8 @@ EXTRA_COMMANDS: list = [           # (name, description): simple [symbol] comman
     ("unmonitor", "Stop the live monitor card"),
     ("last-week", "Last completed Mon-Fri: crosses, 200 crosses, positions, P&L, week chart"),
 ]
+NOTIFY_ACTIONS = ("status", "prefs", "test")                      # /notify
+TM_ACTIONS = ("status", "enable", "disable")                      # /trade_management
 
 
 def chunks(text: str, size: int = 1990) -> list[str]:
@@ -324,8 +346,8 @@ def build_discord_client():
                     kw["view"] = view
             await inter.followup.send(part, **kw)
 
-    async def allowed(inter, trade=False) -> bool:
-        ok = (can_trade if trade else authorised)(inter.user.id, inter.channel_id)
+    async def allowed(inter, trade=False, scope: str | None = None) -> bool:
+        ok = may(inter.user.id, inter.channel_id, scope or ("trade" if trade else "read"))
         if not ok:
             await inter.response.send_message("⛔ You are not allowed to do that here.", ephemeral=True)
         return ok
@@ -359,17 +381,29 @@ def build_discord_client():
             return simple
         tree.command(name=name, description=desc)(make(name))
 
-    class Confirm(discord.ui.View):
-        def __init__(self, user_id: int, payload: dict):
-            super().__init__(timeout=C.PLACE_CONFIRM_SECONDS)
-            self.user_id, self.payload, self.message, self.used = user_id, payload, None, False
+    class ConfirmView(discord.ui.View):
+        """One explicit confirmation, used by every confirm step (order, close, trade management): only the user
+        who asked can press it, it works once (the flag is set before any await, so clicks cannot race), Cancel
+        uses it up too, and it expires. `run()` sends the confirmed command and returns the bot's reply."""
+        def __init__(self, user_id: int, run, *, label: str, cancelled: str, expired: str,
+                     not_yours: str = "Not yours, or already handled.", already: str | None = None,
+                     ephemeral: bool = False, timeout: float = C.PLACE_CONFIRM_SECONDS):
+            super().__init__(timeout=timeout)
+            self.user_id, self.run, self.message, self.used = user_id, run, None, False
+            self.texts = {"cancelled": cancelled, "expired": expired, "not_yours": not_yours,
+                          "already": already or not_yours}
+            self.ephemeral = ephemeral
+            self.confirm = discord.ui.Button(label=label, style=discord.ButtonStyle.danger)
+            self.cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+            self.confirm.callback, self.cancel.callback = self._confirm, self._cancel
+            self.add_item(self.confirm); self.add_item(self.cancel)
 
         async def interaction_check(self, inter: discord.Interaction) -> bool:
             if inter.user.id != self.user_id:
-                await inter.response.send_message("Only the person who typed /place can confirm it.", ephemeral=True)
+                await inter.response.send_message(self.texts["not_yours"], ephemeral=True)
                 return False
             if self.used:                                          # a second click while the first is being handled
-                await inter.response.send_message("Already handled — one order per /place.", ephemeral=True)
+                await inter.response.send_message(self.texts["already"], ephemeral=True)
                 return False
             self.used = True                                       # set before any await: clicks cannot race
             return True
@@ -380,16 +414,14 @@ def build_discord_client():
             self.stop()
             await inter.edit_original_response(content=text, view=self)
 
-        @discord.ui.button(label="Confirm order", style=discord.ButtonStyle.danger)
-        async def confirm(self, inter: discord.Interaction, _button):
-            await inter.response.defer()
-            reply = await ask("place", self.payload)
+        async def _confirm(self, inter: discord.Interaction):
+            await (inter.response.defer(ephemeral=True) if self.ephemeral else inter.response.defer())
+            reply = await self.run()
             await self.finish(inter, reply.get("text", "no reply"))
 
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel(self, inter: discord.Interaction, _button):
-            await inter.response.defer()
-            await self.finish(inter, "Cancelled — nothing was placed.")
+        async def _cancel(self, inter: discord.Interaction):
+            await (inter.response.defer(ephemeral=True) if self.ephemeral else inter.response.defer())
+            await self.finish(inter, self.texts["cancelled"])
 
         async def on_timeout(self):
             self.used = True
@@ -397,9 +429,16 @@ def build_discord_client():
                 item.disabled = True
             if self.message:
                 try:
-                    await self.message.edit(content="⌛ Expired — nothing was placed.", view=self)
+                    await self.message.edit(content=self.texts["expired"], view=self)
                 except discord.HTTPException:
                     pass
+
+    def Confirm(user_id: int, payload: dict):
+        """/place: Confirm order -> the order is sent (trader.py)."""
+        return ConfirmView(user_id, lambda: ask("place", payload), label="Confirm order",
+                           cancelled="Cancelled — nothing was placed.", expired="⌛ Expired — nothing was placed.",
+                           not_yours="Only the person who typed /place can confirm it.",
+                           already="Already handled — one order per /place.")
 
     @tree.command(name="place", description="Place a market order with stop-loss and take-profit (you confirm before it is sent)")
     @app_commands.describe(symbol="Symbol", side="Buy or sell", lot="Lot size, e.g. 0.5",
@@ -460,40 +499,77 @@ def build_discord_client():
                                             style=STYLE.get(b.get("style"), discord.ButtonStyle.secondary)))
         return view
 
-    class CloseConfirm(discord.ui.View):
+    def CloseConfirm(user_id: int, payload: dict):
         """Close position from a MAX POINT card: one more explicit Confirm, 30 s, one use."""
-        def __init__(self, user_id: int, payload: dict):
-            super().__init__(timeout=C.PLACE_CONFIRM_SECONDS)
-            self.user_id, self.payload, self.used = user_id, payload, False
+        return ConfirmView(user_id, lambda: ask("close", payload), label="Confirm close", ephemeral=True,
+                           cancelled="Cancelled — the position is untouched.",
+                           expired="⌛ Expired — the position is untouched.")
 
-        async def interaction_check(self, inter):
-            if inter.user.id != self.user_id or self.used:
-                await inter.response.send_message("Not yours, or already handled.", ephemeral=True)
-                return False
-            self.used = True
-            return True
+    async def tm_action(inter: discord.Interaction, action: str):
+        """/trade_management and the Enable/Disable buttons. Enabling = a nonce from the bot loop + Confirm."""
+        if action == "status":
+            await inter.response.defer()
+            reply = await ask("trade_management", {"action": "status", "user": inter.user.id,
+                                                   "channel": inter.channel_id})
+            await answer(inter, reply, button_view(reply.get("buttons")))
+            return
+        if not await allowed(inter, scope="manage"):
+            return
+        base = {"user": inter.user.id, "channel": inter.channel_id}
+        await inter.response.defer(ephemeral=True)
+        if action == "disable":                                    # immediate, no confirmation needed
+            reply = await ask("trade_management", {**base, "action": "disable"})
+            await inter.followup.send(str(reply.get("text", "no reply"))[:1990], ephemeral=True)
+            return
+        if action != "enable":
+            await inter.followup.send("Unknown action.", ephemeral=True)
+            return
+        req = await ask("trade_management", {**base, "action": "enable_request"})
+        if not req.get("ok") or not req.get("nonce"):
+            await inter.followup.send(str(req.get("text", "no reply"))[:1990], ephemeral=True)
+            return
+        view = ConfirmView(inter.user.id, lambda: ask("trade_management", {**base, "action": "enable_confirm",
+                                                                          "nonce": req["nonce"]}),
+                           label="Confirm: ENABLE trade management", ephemeral=True,
+                           cancelled="Cancelled — trade management is unchanged.",
+                           expired="⌛ Expired — trade management is unchanged.",
+                           timeout=C.TRADE_MANAGEMENT_CONFIRM_SECONDS)
+        view.message = await inter.followup.send(req["text"], view=view, ephemeral=True, wait=True)
 
-        @discord.ui.button(label="Confirm close", style=discord.ButtonStyle.danger)
-        async def confirm(self, inter, _b):
-            await inter.response.defer(ephemeral=True)
-            reply = await ask("close", self.payload)
-            for item in self.children:
-                item.disabled = True
-            self.stop()
-            await inter.edit_original_response(content=reply.get("text", "no reply"), view=self)
+    @tree.command(name="trade_management", description="Trade management (automatic stop moves): status, enable, disable")
+    @app_commands.choices(action=[app_commands.Choice(name=a.capitalize(), value=a) for a in TM_ACTIONS])
+    async def tm_cmd(inter: discord.Interaction, action: app_commands.Choice[str] | None = None):
+        if not await allowed(inter):
+            return
+        await tm_action(inter, action.value if action else "status")
 
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel(self, inter, _b):
-            for item in self.children:
-                item.disabled = True
-            self.stop()
-            await inter.response.edit_message(content="Cancelled — the position is untouched.", view=self)
+    @tree.command(name="notify", description="Notifications: status (mode, services), prefs, or test every channel")
+    @app_commands.choices(action=[app_commands.Choice(name=a.capitalize(), value=a) for a in NOTIFY_ACTIONS])
+    async def notify_cmd(inter: discord.Interaction, action: app_commands.Choice[str] | None = None):
+        act = action.value if action else "status"
+        if not await allowed(inter, trade=act == "test"):
+            return
+        await inter.response.defer()
+        await answer(inter, await ask("notify", {"action": act, "user": inter.user.id, "channel": inter.channel_id},
+                                      wait_s=15.0))
+
+    @tree.command(name="notify_mode", description="Switch the notification mode (standard = unchanged behaviour)")
+    @app_commands.choices(mode=[app_commands.Choice(name=m.capitalize(), value=m) for m in C.NOTIFY_MODES])
+    async def notify_mode_cmd(inter: discord.Interaction, mode: app_commands.Choice[str]):
+        if not await allowed(inter, trade=True):
+            return
+        await inter.response.defer()
+        await answer(inter, await ask("notify_mode", {"mode": mode.value, "user": inter.user.id,
+                                                      "channel": inter.channel_id}))
 
     TRADE_ACTIONS = {"apply", "close"}                              # need the user listed in DISCORD_ALLOWED_USER_IDS
 
     async def on_button(inter: discord.Interaction, custom_id: str):
         parts = custom_id.split(":")
         action, args = parts[1], parts[2:]
+        if action == "tm":                                        # persistent Enable / Disable on the controls card
+            await tm_action(inter, args[0] if args else "status")
+            return
         if not await allowed(inter, trade=action in TRADE_ACTIONS):
             return
         if action == "close":                                     # Confirm step first, then trader.py closes it
@@ -513,9 +589,15 @@ def build_discord_client():
         if action in ("monitor", "unmonitor"):
             payload["symbol"] = args[0]
         if action in ("apply", "keep"):
-            payload["ticket"] = int(args[0])
-            if len(args) > 1:
-                payload["sl"] = float(args[1])
+            try:
+                payload["ticket"] = int(args[0])
+                if len(args) > 1:
+                    payload["sl"] = float(args[1])
+                if len(args) > 2:
+                    payload["gen"] = int(args[2])              # the trade management generation of the suggestion
+            except (IndexError, ValueError):
+                await inter.followup.send("Malformed button.", ephemeral=True)
+                return
         reply = await ask(action, payload)
         await inter.followup.send(str(reply.get("text", "no reply"))[:1990], ephemeral=True)
 
@@ -618,6 +700,7 @@ def build_discord_client():
         await m.channel.send(await run_text(cmd))
 
     client.tree, client.Confirm, client.CloseConfirm, client.on_button = tree, Confirm, CloseConfirm, on_button
+    client.ConfirmView, client.tm_action = ConfirmView, tm_action
     client.button_view, client.post_outbox_item = button_view, post_outbox_item
     return client
 
