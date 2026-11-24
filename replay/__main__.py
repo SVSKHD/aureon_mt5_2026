@@ -13,6 +13,8 @@ def main(argv=None):
     if argv[:1] == ["app"]:
         from replay.app.main import main as app_main
         return app_main(argv[1:])
+    if argv[:1] == ["compare"]:
+        return compare_main(argv[1:])
     import config as C
     from replay import api
     ap = argparse.ArgumentParser(prog="python -m replay", description="Aureon historical replay (simulation only)")
@@ -20,10 +22,10 @@ def main(argv=None):
     ap.add_argument("--tf", default="M30", choices=["M15", "M30", "H1", "H4"])
     ap.add_argument("--from", dest="start", required=True, help="server time, e.g. 2026-10-01 or '2026-10-01 06:00'")
     ap.add_argument("--to", dest="end", required=True)
-    ap.add_argument("--source", default="mt5", choices=["mt5", "csv", "cache"])
+    ap.add_argument("--source", default="auto", choices=["mt5", "csv", "cache", "auto"])
     ap.add_argument("--csv")
     ap.add_argument("--csv-tz", choices=["utc", "server"], help="time column zone (a time_utc column is always UTC)")
-    ap.add_argument("--strategy", default="indicators", choices=["indicators", "ema_cross", "pullback", "manual"])
+    ap.add_argument("--strategy", default="indicators", choices=["indicators", "ema_cross", "pullback", "manual", "ema_20_50_basic"])
     ap.add_argument("--params", default="{}", help='JSON, e.g. {"align_200": true} or {"trades": [...]}')
     ap.add_argument("--protective", default="{}", help='JSON, e.g. {"sl_mode": "atr", "sl": 2, "tp_mode": "r", "tp": 2}')
     ap.add_argument("--sizing", default="{}", help='JSON, e.g. {"mode": "risk", "risk_pct": 1}')
@@ -45,6 +47,35 @@ def main(argv=None):
     t0 = time.monotonic()
     p.session.run()
     rep, files = api.finish(p, time.monotonic() - t0)
+    print(open(files["summary"], encoding="utf-8").read())
+    print("Files:", json.dumps(files, indent=1))
+    return 0
+
+
+def compare_main(argv):
+    """python -m replay compare --from 2026-10-01 --to 2026-10-31 --source csv --csv ... [--strategies a,b]"""
+    import config as C
+    from datetime import datetime
+    from replay import compare, data as D
+    from replay.broker import Costs
+    ap = argparse.ArgumentParser(prog="python -m replay compare", description="Compare strategies on identical data")
+    ap.add_argument("--symbol", default="XAUUSD"); ap.add_argument("--tf", default="M30")
+    ap.add_argument("--from", dest="start", required=True); ap.add_argument("--to", dest="end", required=True)
+    ap.add_argument("--source", default="auto", choices=["mt5", "csv", "cache", "auto"])
+    ap.add_argument("--csv"); ap.add_argument("--csv-tz", choices=["utc", "server"])
+    ap.add_argument("--strategies", default=",".join(compare.DEFAULT_SET))
+    ap.add_argument("--protective", default="{}"); ap.add_argument("--trade-management", action="store_true")
+    ap.add_argument("--balance", type=float, default=float(C.REPLAY_ACCOUNT_BALANCE))
+    ap.add_argument("--out", required=False)
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    ds = D.load(a.symbol, a.tf, datetime.fromisoformat(a.start), datetime.fromisoformat(a.end), source=a.source,
+                csv_path=a.csv, csv_tz=a.csv_tz)
+    rep = compare.run(ds, [x.strip() for x in a.strategies.split(",") if x.strip()],
+                      protective=json.loads(a.protective) or None, costs=Costs(), balance=a.balance,
+                      trade_management=a.trade_management)
+    import os
+    files = compare.write(rep, a.out or os.path.join(C.DATA_DIR, "replay", rep["session"] + "-compare"))
     print(open(files["summary"], encoding="utf-8").read())
     print("Files:", json.dumps(files, indent=1))
     return 0

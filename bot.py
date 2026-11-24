@@ -15,7 +15,7 @@ import config as C
 import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report, updater
 import uploader
 import signal_engine
-import notify, trade_mgmt
+import notify, trade_mgmt, guardian
 
 C.migrate_legacy_files()
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -104,10 +104,13 @@ CATCH_UP: dict = {}                                    # (symbol, tf) -> (link d
 
 
 def _connect() -> str | None:
-    """shutdown + initialize. None on success, else the error."""
+    """shutdown + initialize (the OWNED terminal when MT5_TERMINAL_PATH is set). None on success, else the error."""
     mt5.shutdown()
-    if not mt5.initialize():
-        return f"MT5 init failed: {mt5.last_error()}"
+    ok = mt5.initialize(path=C.MT5_TERMINAL_PATH) if C.MT5_TERMINAL_PATH else mt5.initialize()
+    if not ok:
+        err = mt5.last_error()
+        GUARD.init_failed(err)
+        return f"MT5 init failed: {err}"
     for sym in C.enabled_symbols():                                # disabled symbols are never touched
         mt5.symbol_select(C.broker_symbol(sym), True)
     signals.sync_server_offset()
@@ -131,8 +134,32 @@ def _link_up():
 
 def reset_link():
     """Forget any outage in progress (tests; a fresh process starts this way)."""
+    global GUARD
     _link.update(since=None, since_srv=None, attempts=0, next_try=0.0, blind=False, ever_up=False)
     CATCH_UP.clear()
+    GUARD = _make_guardian()
+
+
+def _reconcile() -> dict:
+    """After a recovery: re-read every position from MT5 (opened/closed while away are reported by positions.track)
+    and count the candles that will be replayed as a digest. Nothing is sent to the broker."""
+    positions.track(state, LABELS)
+    open_n = sum(len(v) for v in positions.OPEN.values())
+    no_sl = sum(1 for v in positions.OPEN.values() for p in v if not p.sl)
+    out = {"open positions": open_n, "missed-candle digests": len(CATCH_UP)}
+    if no_sl:
+        out["without SL"] = no_sl
+    return out
+
+
+def _make_guardian() -> "guardian.Guardian":
+    g = guardian.Guardian(mt5, clock=lambda: _mono(), server_now=lambda: signals.server_now(),
+                          notify=lambda card: notify.send_async(card, "guardian"), reconcile=_reconcile)
+    g.on_change = lambda: post_controls()                          # the status card follows the connection
+    return guardian.install(g)
+
+
+GUARD = _make_guardian()
 
 
 def reconnect_wait() -> float:
@@ -147,6 +174,16 @@ def reconnect_wait() -> float:
 
 
 def ensure_mt5() -> str | None:
+    """The bot's health check + reconnect step; every result is reported to the Connection Guardian."""
+    problem = _ensure_mt5()
+    try:
+        GUARD.observe(problem, attempts=_link["attempts"])
+    except Exception:
+        log.exception("guardian failed (the bot carries on)")
+    return problem
+
+
+def _ensure_mt5() -> str | None:
     """None when the feed is healthy, else the reason (so the loop can tell you it is blind).
     Link lost (terminal attached, connected == False): no initialize() for RECONNECT_GRACE_SECONDS, the terminal
     reconnects by itself. Terminal gone or other problem: initialize at once. Either way failed attempts back off
@@ -181,15 +218,15 @@ def _outage(problem: str) -> str | None:
             log.warning("MT5: %s — waiting up to %d s for the terminal to reconnect by itself",
                         problem, C.RECONNECT_GRACE_SECONDS)
             return problem
-    if now < _link["next_try"]:
-        return problem                                             # grace window / backoff: terminal_info() only
+    if now < _link["next_try"] or GUARD.hold():
+        return problem                                             # grace window / backoff / restarted terminal starting
     _link["attempts"] += 1
     err = _connect()
     if err is None:                                                # the link is back (a stale tick or a clock still
         _link_up()                                                 # being measured is the feed's business, not ours)
         return signals.health()
     problem = err
-    wait = C.RECONNECT_BACKOFF[min(_link["attempts"], len(C.RECONNECT_BACKOFF)) - 1]
+    wait = GUARD.retry_delay(C.RECONNECT_BACKOFF[min(_link["attempts"], len(C.RECONNECT_BACKOFF)) - 1])
     _link["next_try"] = _mono() + wait
     log.warning("MT5 reconnect attempt %d failed: %s — next try in %d s", _link["attempts"], problem, wait)
     return problem
@@ -609,7 +646,7 @@ def chart_reply(symbol: str) -> dict:
 STATUS_LINES: list = [lambda sym: f"Market: {market_status(sym)}" if market_status(sym) else "",
                       lambda sym: monitor.status_line(state, sym),
                       lambda sym: uploader.status_line(),
-                      notify.status_line, trade_mgmt.status_line]
+                      notify.status_line, trade_mgmt.status_line, lambda sym: GUARD.status_line()]
 
 
 def status_reply(symbol: str) -> dict:
@@ -657,7 +694,71 @@ JSON_COMMANDS: dict = {                                            # name -> han
     "notify": lambda req: notify.command(state, req),
     "notify_mode": lambda req: notify.set_mode(state, req),
     "trade_management": lambda req: trade_management_cmd(req),
+    "notification_mode": lambda req: (notify.set_mode(state, req) if req.get("mode") else notify.command(state, req)),
+    "mt5_health": lambda req: mt5_health_cmd(req),
+    "mt5_connection": lambda req: mt5_connection_cmd(req),
+    "mt5_reconnect": lambda req: mt5_reconnect_cmd(req),
+    "replay_status": lambda req: replay_status_cmd(req),
 }
+
+
+def mt5_health_cmd(req: dict) -> dict:
+    """/mt5_health: the Guardian's view right now (state, cause, account check, tick age, order permission)."""
+    g = GUARD.snapshot()
+    lines = [f"**MT5: {g['state']}**" + (f" · {g['cause']}" if g["cause"] != "ok" else "") + f" · for {g['for_seconds']} s",
+             f"Account: {g['account']} · orders: {g['orders']}",
+             f"Last tick: {g['tick_age_s']} s ago" if g["tick_age_s"] is not None else "Last tick: unknown",
+             f"Terminal restart: {g['restart']}" + (f" · cooldown {g['cooldown_s']} s" if g["cooldown_s"] else "")
+             + (f" · this outage: {g['outage_attempts']} reconnect attempts, {g['outage_restarts']} restarts"
+                if g["outage_attempts"] or g["outage_restarts"] else ""),
+             trade_mgmt.status_line(), notify.status_line()]
+    return {"ok": True, "text": "\n".join(lines), "buttons": trade_mgmt.buttons()}
+
+
+def mt5_connection_cmd(req: dict) -> dict:
+    """/mt5_connection: the health timeline (disconnections, attempts, restarts, recoveries)."""
+    rows = GUARD.timeline[-15:]
+    if not rows:
+        return {"ok": True, "text": "No connection events recorded yet."}
+    return {"ok": True, "text": "**MT5 connection timeline (UTC)**\n" + "\n".join(
+        f"`{r['ts'][5:19].replace('T', ' ')}` {r['from']} → **{r['state']}** · {r['cause']}"
+        + (f" · {r['detail'][:80]}" if r.get("detail") else "") for r in reversed(rows))}
+
+
+def mt5_reconnect_cmd(req: dict) -> dict:
+    """/mt5_reconnect: one API reconnect + account check NOW, from the bot loop. Never restarts the terminal (that
+    stays with the Guardian's rules) and never sends an order."""
+    if not alerts.may(req.get("user"), req.get("channel"), "trade"):
+        return {"ok": False, "text": "⛔ NOT done — this user is not explicitly listed in DISCORD_ALLOWED_USER_IDS."}
+    err = _connect()
+    problem = err or signals.health()
+    GUARD.observe(problem, attempts=_link["attempts"])
+    if problem is None:
+        _link_up()
+    log.warning("MT5 reconnect requested by %s -> %s", req.get("user"), problem or "ok")
+    return {"ok": problem is None, "text": (f"✅ Reconnected · MT5 {GUARD.state}" if problem is None else
+                                            f"❌ Still not connected: {problem} · MT5 {GUARD.state}")}
+
+
+def replay_status_cmd(req: dict) -> dict:
+    """/replay_status: what the Replay Lab (a separate program) last reported. Read-only; it never affects the bot."""
+    from notifier import load_json
+    path = os.path.join(C.DATA_DIR, "replay", "status.json")
+    d, _ = load_json(path, {})
+    if not d:
+        return {"ok": True, "text": "No replay has run on this PC yet (python -m replay app)."}
+    age = ""
+    try:
+        age = f" · updated {(datetime.now(timezone.utc) - datetime.fromisoformat(d['updated_utc'])).total_seconds():.0f} s ago"
+    except Exception:
+        pass
+    dc = d.get("discord") or {}
+    return {"ok": True, "text": f"**HISTORICAL REPLAY · {d.get('state', '?').upper()}**{age}\n"
+            f"{d.get('symbol')} {d.get('tf')} · {d.get('strategy')} v{d.get('version')} · candle {d.get('done')}/{d.get('total')}"
+            f" · at {str(d.get('hist_time', '')).replace('T', ' ')} (server)\n"
+            f"Replay trade management: {'ON (simulated)' if d.get('trade_management') else 'OFF'} · session {d.get('session')}\n"
+            f"Replay Discord: " + (f"delivered {dc.get('delivered')} / attempted {dc.get('attempted')} · failed {dc.get('failed')}"
+                                   if dc.get("enabled") else "off")}
 
 
 def trade_management_cmd(req: dict) -> dict:

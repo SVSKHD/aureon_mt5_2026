@@ -56,6 +56,10 @@ def _build(req: dict) -> tuple[dict | None, dict]:
     # ---- the request itself ----
     if not C.PLACE_ENABLED:
         return None, _fail("trading is switched off. Set PLACE_ENABLED=1 in .env and restart.")
+    import guardian
+    why = guardian.order_block()                                  # wrong account / recovering: fail closed
+    if why:
+        return None, _fail(f"{why}.")
     side = str(req.get("side", "")).lower()
     filling = str(req.get("filling") or "auto").lower()
     if side not in ("buy", "sell"):
@@ -327,6 +331,10 @@ def close_position(req: dict) -> dict:
     Sends the opposite market deal for the whole volume, then reads back that the position is gone."""
     if not C.PLACE_ENABLED:
         return {"ok": False, "text": "❌ NOT closed — trading is switched off (PLACE_ENABLED). Close it in MT5."}
+    import guardian
+    why = guardian.order_block()
+    if why:
+        return {"ok": False, "text": f"❌ NOT closed — {why}. Close it in MT5."}
     try:
         ticket = int(req["ticket"])
     except (KeyError, TypeError, ValueError):

@@ -272,6 +272,46 @@ except ValueError:
     TRADE_MANAGEMENT_USER_IDS = {-1}                               # malformed: nobody (fail closed)
 TRADE_MANAGEMENT_CONFIRM_SECONDS = 30
 
+# ---- MT5 Connection Guardian (guardian.py, terminal.py): classifies connection problems, verifies the account,
+# and (only if enabled) restarts the ONE terminal at MT5_TERMINAL_PATH. The reconnect backoff above (RECONNECT_*)
+# stays the single retry schedule. MT5_EXPECTED_LOGIN differs from PLACE_ACCOUNT_LOGINS: it is the account the
+# terminal must be logged into for ANY order (management or /place) to be allowed; empty = not checked.
+def _flag(key: str, default: str) -> bool:
+    return env(key, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+MT5_GUARDIAN_ENABLED = _flag("MT5_GUARDIAN_ENABLED", "true")
+MT5_AUTO_RECOVERY_ENABLED = _flag("MT5_AUTO_RECOVERY_ENABLED", "true")
+MT5_TERMINAL_RESTART_ENABLED = _flag("MT5_TERMINAL_RESTART_ENABLED", "false")
+MT5_HEALTH_CHECK_SECONDS = env("MT5_HEALTH_CHECK_SECONDS", "10")
+MT5_RECOVERY_MAX_ATTEMPTS = env("MT5_RECOVERY_MAX_ATTEMPTS", "3")      # terminal restarts per outage, at most
+MT5_RECOVERY_COOLDOWN_SECONDS = env("MT5_RECOVERY_COOLDOWN_SECONDS", "300")
+MT5_EXPECTED_LOGIN = env("MT5_EXPECTED_LOGIN").strip()
+MT5_EXPECTED_SERVER = env("MT5_EXPECTED_SERVER").strip()
+MT5_TERMINAL_PATH = env("MT5_TERMINAL_PATH").strip()                   # e.g. C:\Program Files\Broker MT5\terminal64.exe
+MT5_TERMINAL_DATA_DIR = env("MT5_TERMINAL_DATA_DIR").strip()           # = the install folder for a /portable terminal
+MT5_MARKET_BREAK = env("MT5_MARKET_BREAK", "23:55-01:10")             # daily break, server time (not a failure)
+MT5_FROZEN_SECONDS = 1800                                              # open market, connected, no tick this long
+
+
+def guardian_problems() -> list[str]:
+    import re
+    bad = []
+    for key in ("MT5_HEALTH_CHECK_SECONDS", "MT5_RECOVERY_MAX_ATTEMPTS", "MT5_RECOVERY_COOLDOWN_SECONDS"):
+        try:
+            if float(globals()[key]) <= 0:
+                raise ValueError
+        except ValueError:
+            bad.append(f"{key} must be a number greater than 0")
+    if MT5_EXPECTED_LOGIN and not MT5_EXPECTED_LOGIN.isdigit():
+        bad.append("MT5_EXPECTED_LOGIN must be the account number")
+    if MT5_TERMINAL_RESTART_ENABLED and not MT5_TERMINAL_PATH:
+        bad.append("MT5_TERMINAL_RESTART_ENABLED needs MT5_TERMINAL_PATH (the terminal the bot owns)")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d", MT5_MARKET_BREAK or ""):
+        bad.append("MT5_MARKET_BREAK must be 'HH:MM-HH:MM' (server time)")
+    return bad
+
+
 # ---- Replay Lab (replay/): historical replay and backtests. Read ONLY by the replay tools, never by the live bot.
 # Everything simulated; nothing here can reach the live order path, the live alert channels or the live state.
 REPLAY_DISCORD_ENABLED = env("REPLAY_DISCORD_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -345,6 +385,8 @@ HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 DISCORD_MESSAGES_FILE = os.path.join(STATE_DIR, "discord_messages.json")   # written by the Discord thread only
 NOTIFY_STATE_FILE = os.path.join(STATE_DIR, "notify.json")                 # notify.py: mode, buffers (bot loop only)
 TRADE_MANAGEMENT_FILE = os.path.join(STATE_DIR, "trade_management.json")   # trade_mgmt.py (bot loop only)
+GUARDIAN_FILE = os.path.join(STATE_DIR, "guardian.json")                   # guardian.py: LIVE connection state
+OPS_DIR = os.path.join(DATA_DIR, "ops")                                    # ops.py: live-*.jsonl (replay: its own folder)
 NOTIFY_AUDIT_DIR = os.path.join(DATA_DIR, "notify")                        # audit-YYYY-MM.jsonl (NOT a record file)
 WATCHDOG_LOCK = os.path.join(STATE_DIR, "watchdog.lock")
 
@@ -464,6 +506,7 @@ def validate(symbol_check=None) -> list[str]:
     if PLACE_ENABLED and not (DISCORD_BOT_TOKEN and DISCORD_ALLOWED_USER_IDS):
         bad.append("PLACE_ENABLED=1 needs DISCORD_BOT_TOKEN and DISCORD_ALLOWED_USER_IDS (who may place orders)")
     bad += notify_problems()
+    bad += guardian_problems()
     if WARMUP_BARS < 3 * EMA_TREND:
         bad.append("WARMUP_BARS must be at least 3x EMA_TREND or EMA200 will not match the chart")
     if SERVER_UTC_OFFSET_HOURS is None and SERVER_TZ:

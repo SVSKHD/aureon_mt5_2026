@@ -18,13 +18,16 @@ export interface PanelState {
   discord: Record<string, number | boolean | string | null> | null;
   report: { summary: string; files: Record<string, string> } | null;
   selected: ReplayEvent | null;
+  selectedTrade: Trade | null;
+  focusTradeId: number | null;
   csvPath: string;
   version: number;
 }
 
 const initial: PanelState = {
   config: null, session: null, state: "idle", error: null, events: [], counts: {}, openTrades: [], closedTrades: [],
-  progress: null, equity: null, balance: null, status: "", discord: null, report: null, selected: null, csvPath: "",
+  progress: null, equity: null, balance: null, status: "", discord: null, report: null, selected: null,
+  selectedTrade: null, focusTradeId: null, csvPath: "",
   version: 0,
 };
 

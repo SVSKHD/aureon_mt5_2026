@@ -92,8 +92,18 @@ class VirtualTrade:
     ambiguous: bool = False
     sl_moves: list = field(default_factory=list)
     blocked_steps: list = field(default_factory=list)
-    mfe: float = 0.0
+    mfe: float = 0.0                  # maximum favourable / adverse excursion, price units (from candle extremes)
     mae: float = 0.0
+    # the trade debugger: everything needed to explain (and reproduce) the trade
+    strategy_version: str = ""
+    param_hash: str = ""
+    entry_signal: str = ""
+    conditions: list = field(default_factory=list)      # [{"name", "passed", "value"}] at the deciding close
+    decided_index: int | None = None
+    exit_index: int | None = None
+    mfe_money: float | None = None
+    mae_money: float | None = None
+    risk_money: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,6 +122,8 @@ class Intent:
     reason: str = ""
     event_key: str | None = None
     event_type: str | None = None
+    signal: str = ""                  # what triggered it, in words
+    conditions: list = field(default_factory=list)
 
 
 class VirtualBroker:
@@ -137,11 +149,13 @@ class VirtualBroker:
     def equity(self, bid: float) -> float:
         return self.balance + sum(self.floating(t, bid) for t in self.open)
 
-    def submit(self, intents: list[Intent], decided_time: str, strategy: str):
+    def submit(self, intents: list[Intent], decided_time: str, strategy: str, decided_index: int | None = None,
+               version: str = "", param_hash: str = ""):
         for it in intents:
             it.reason = it.reason or strategy
             self.pending.append(it)
         self._decided = decided_time
+        self._decided_meta = {"decided_index": decided_index, "strategy_version": version, "param_hash": param_hash}
 
     # --------------------------------------------------------------------------------------- per bar
     def on_open(self, i: int, bar: dict, strategy: str) -> list[dict]:
@@ -156,6 +170,9 @@ class VirtualBroker:
                              getattr(self, "_decided", ""))
             self._next_id += 1
             t.entry_time, t.open_index = bar["time"], i
+            for k, v in getattr(self, "_decided_meta", {}).items():
+                setattr(t, k, v)
+            t.entry_signal, t.conditions = it.signal or it.reason, list(it.conditions)
             t.entry_price = round(self._fill_open(it.side, bar["open"]), self.spec.digits)
             t.sl = it.sl if it.sl is not None else (t.entry_price - it.side * it.sl_dist if it.sl_dist else None)
             t.tp = it.tp if it.tp is not None else (t.entry_price + it.side * it.tp_dist if it.tp_dist else None)
@@ -238,8 +255,12 @@ class VirtualBroker:
         t.gross = round(self.spec.money(t.side * (t.exit_price - t.entry_price), t.lots), 2)
         t.commission = round(self.costs.commission_per_lot * t.lots, 2)
         t.net = round(t.gross - t.commission, 2)
+        t.exit_index = bar.get("i")
+        t.mfe_money = round(self.spec.money(t.mfe, t.lots), 2)
+        t.mae_money = round(self.spec.money(t.mae, t.lots), 2)
         if t.initial_sl:
             risk = self.spec.money(abs(t.entry_price - t.initial_sl), t.lots)
+            t.risk_money = round(risk, 2)
             t.r_multiple = round(t.net / risk, 3) if risk > 0 else None
         self.balance += t.net
         self.open.remove(t)

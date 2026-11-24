@@ -172,7 +172,7 @@ def resample(df: pd.DataFrame, src_tf: str, tf: str) -> pd.DataFrame:
 class ReadOnlyMT5:
     """The only MT5 surface the Replay Lab uses: candle and symbol reads. There is deliberately no attribute that
     can send, check or modify an order; asking for one raises."""
-    ALLOWED = ("initialize", "shutdown", "symbol_select", "symbol_info", "copy_rates_range", "copy_rates_from",
+    ALLOWED = ("initialize", "symbol_select", "symbol_info", "copy_rates_range", "copy_rates_from",
                "last_error", "TIMEFRAME_M1", "TIMEFRAME_M5", "TIMEFRAME_M15", "TIMEFRAME_M30", "TIMEFRAME_H1",
                "TIMEFRAME_H4")
 
@@ -315,7 +315,7 @@ def load_cache(symbol: str, tf: str, source: str, tz_name: str) -> pd.DataFrame 
         if meta.get("server_tz") != tz_name:                       # times were written for another server clock
             log.warning("cache %s was written for %s, not %s: ignored", path, meta.get("server_tz"), tz_name)
             return None
-        df = pd.read_csv(path, compression="gzip")
+        df = pd.read_csv(path, compression="gzip", float_precision="round_trip")   # bit-exact prices
         df["time"] = pd.to_datetime(df["time"])
         return df
     except Exception:
@@ -364,9 +364,23 @@ def load(symbol: str, tf: str, start: datetime, end: datetime, source: str = "mt
         if raw is None:
             raise DataError(f"no cached {symbol} {tf} candles (download from MT5 or import a CSV first)")
         label = "cache(mt5)"
+    elif source == "auto":                                         # MT5, or the cache while MT5 is unavailable
+        try:
+            raw = from_mt5(symbol, tf, start, end, warmup, mt5=mt5, now_server=now_server)
+            if use_cache:
+                save_cache(symbol, tf, "mt5", raw, tz_name)
+            label = "mt5"
+        except Exception as e:                                     # terminal down, not installed, no history ...
+            raw = load_cache(symbol, tf, "mt5", tz_name)
+            if raw is None:
+                raise DataError(f"MT5 is unavailable ({e}) and there is no cached {symbol} {tf} history") from e
+            label = "cache(mt5)"
+            fallback_note = f"MT5 unavailable ({str(e)[:120]}): replaying the cached history"
     else:
-        raise DataError("source must be mt5, csv or cache")
+        raise DataError("source must be mt5, csv, cache or auto")
     df, problems, dropped = normalise(raw, tz_name)
+    if source == "auto" and label != "mt5":
+        problems.insert(0, fallback_note)
     in_range = (df["time"] >= start) & (df["time"] < end)
     if not in_range.any():
         have = f"{df['time'].iloc[0]} → {df['time'].iloc[-1]}" if len(df) else "nothing"

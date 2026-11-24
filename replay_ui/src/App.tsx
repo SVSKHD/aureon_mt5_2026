@@ -4,6 +4,11 @@ import { ReplayChart, THEME } from "./chart";
 import { store } from "./store";
 import type { Bar, InMsg, ReplayEvent, Trade } from "./types";
 
+/** The full trade record for a trade id (closed trades carry everything; open ones come with each batch). */
+function findTrade(id: number): Trade | null {
+  return store.s.closedTrades.find((t) => t.id === id) ?? store.s.openTrades.find((t) => t.id === id) ?? null;
+}
+
 const SPEEDS: [string, number | null][] = [["0.5×", 0.5], ["1×", 1], ["2×", 2], ["5×", 5], ["10×", 10], ["30×", 30], ["60×", 60], ["Max", null]];
 const fmt = (x: number | null | undefined, d = 2) => (x === null || x === undefined ? "–" : x.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }));
 
@@ -17,7 +22,8 @@ export default function App({ bridge }: { bridge: Bridge }) {
   const chart = useRef<ReplayChart | null>(null);
   const readout = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
-  const [panels, setPanels] = useState({ details: true, timeline: true, trades: true, stats: true });
+  const [panels, setPanels] = useState({ details: true, debugger: true, timeline: true, trades: true, stats: true });
+  const [jumpAt, setJumpAt] = useState("");
   const [sideOpen, setSideOpen] = useState(true);
   const [speed, setSpeed] = useState<number | null>(2);
   const [spacing, setSpacing] = useState(8);
@@ -35,7 +41,10 @@ export default function App({ bridge }: { bridge: Bridge }) {
     c.onFollow = setFollowing;
     c.onClickEvent = (seq) => {
       const e = store.s.events.find((x) => x.seq === seq);
-      if (e) store.update({ selected: e }, true);
+      if (!e) return;
+      const tr = (e.details as { trade?: Trade; trade_id?: number });
+      const id = tr.trade?.id ?? tr.trade_id;
+      store.update({ selected: e, selectedTrade: id !== undefined ? findTrade(id) ?? tr.trade ?? null : store.s.selectedTrade }, true);
     };
     c.onCrosshair = ({ bar }) => paintReadout(readout.current, bar ?? lastBar.current, digits);
     (window as unknown as { __chart: ReplayChart }).__chart = c;
@@ -57,6 +66,10 @@ export default function App({ bridge }: { bridge: Bridge }) {
           if (m.bars.length) lastBar.current = m.bars[m.bars.length - 1];
           if (m.forming) lastBar.current = m.forming;
           store.addEvents(m.events);
+          if (store.s.focusTradeId !== null && !store.s.selectedTrade) {
+            const tr = findTrade(store.s.focusTradeId);
+            if (tr) store.update({ selectedTrade: tr });
+          }
           store.update({ progress: m.progress ?? store.s.progress, openTrades: m.open_trades ?? store.s.openTrades,
             equity: m.equity ?? store.s.equity, balance: m.balance ?? store.s.balance, status: m.status ?? store.s.status });
           break;
@@ -68,6 +81,13 @@ export default function App({ bridge }: { bridge: Bridge }) {
           break;
         case "report":
           store.update({ report: { summary: m.summary, files: m.files } }, true);
+          break;
+        case "jump_view":
+          c.jumpTo(m.time);
+          break;
+        case "focus_trade":
+          store.update({ focusTradeId: m.trade_id, selectedTrade: null }, true);
+          c.jumpTo(m.jump_time);
           break;
         case "csv_picked":
           store.update({ csvPath: m.path }, true);
@@ -161,6 +181,9 @@ export default function App({ bridge }: { bridge: Bridge }) {
         <label title="Candle spacing">↔ <input type="range" min={2} max={30} value={spacing} onChange={(e) => { setSpacing(+e.target.value); chart.current?.setSpacing(+e.target.value); }} /></label>
         <button onClick={jump} className={following ? "" : "attn"} title="End">{following ? "● Live edge" : "⇥ Jump to latest"}</button>
         <button onClick={() => { setSignals(!signals); chart.current?.setSignalsVisible(!signals); }} title="M">{signals ? "Markers ✓" : "Markers ✕"}</button>
+        <input type="datetime-local" value={jumpAt} onChange={(e) => setJumpAt(e.target.value)} disabled={!active} title="Jump to a date (server time)" />
+        <button onClick={() => jumpAt && send("jump", { time: jumpAt })} disabled={!active || !jumpAt} title="Evaluates every candle up to that date, then pauses (J)">Go</button>
+        <button onClick={() => send("compare")} disabled={!s.session} title="Run every verified strategy on the same candles">Compare</button>
         <button onClick={() => setSideOpen(!sideOpen)} title="P">{sideOpen ? "Panels ⟩" : "⟨ Panels"}</button>
         <button onClick={fullscreen} title="F">⛶</button>
         <div className="progress" title={`${s.progress?.done ?? 0} / ${s.progress?.total ?? 0}`}><div style={{ width: `${pct}%` }} /></div>
@@ -172,6 +195,7 @@ export default function App({ bridge }: { bridge: Bridge }) {
           <div ref={chartEl} className="chart" />
           <div ref={readout} className="readout mono" />
           <div className="legend"><i style={{ background: THEME.ema8 }} />EMA 8 <i style={{ background: THEME.ema32 }} />EMA 32 <i style={{ background: THEME.ema200 }} />EMA 200
+            {s.session && (s.session.warmup[0]?.ema20 !== undefined) && <><i style={{ background: THEME.ema20 }} />EMA 20 <i style={{ background: THEME.ema50 }} />EMA 50 <span>☁ cloud</span></>}
             <span className="hist">HISTORICAL REPLAY · simulated</span></div>
           {!s.session && <div className="empty">Choose a symbol, timeframe and date range, then <b>Load &amp; start</b>.<br />Candles are revealed one closed candle at a time; nothing from the future is ever drawn.</div>}
         </div>
@@ -179,11 +203,15 @@ export default function App({ bridge }: { bridge: Bridge }) {
           <Panel title="Signal details" open={panels.details} toggle={() => setPanels({ ...panels, details: !panels.details })}>
             <Details e={s.selected} />
           </Panel>
+          <Panel title={s.selectedTrade ? `Trade debugger · #${s.selectedTrade.id}` : "Trade debugger"} open={panels.debugger} toggle={() => setPanels({ ...panels, debugger: !panels.debugger })}>
+            <Debugger t={s.selectedTrade} digits={digits} strategy={s.session?.strategy as { name?: string; version?: string; param_hash?: string; experimental?: boolean } | undefined}
+              replay={(id) => send("replay_trade", { trade_id: id, before: 8 })} />
+          </Panel>
           <Panel title={`Notifications (${s.events.length})`} open={panels.timeline} toggle={() => setPanels({ ...panels, timeline: !panels.timeline })} grow>
             <Timeline events={s.events} version={s.version} onPick={(e) => { store.update({ selected: e }, true); chart.current?.jumpTo(e.bar_time); }} />
           </Panel>
           <Panel title={`Trades (${s.openTrades.length} open · ${s.closedTrades.length} closed)`} open={panels.trades} toggle={() => setPanels({ ...panels, trades: !panels.trades })}>
-            <Trades open={s.openTrades} closed={s.closedTrades} digits={digits} />
+            <Trades open={s.openTrades} closed={s.closedTrades} digits={digits} onPick={(t) => { store.update({ selectedTrade: t }, true); if (t.entry_time) chart.current?.jumpTo(t.entry_time); }} />
           </Panel>
           <Panel title="Statistics" open={panels.stats} toggle={() => setPanels({ ...panels, stats: !panels.stats })}>
             <Stats />
@@ -259,13 +287,40 @@ function Timeline({ events, onPick, version }: { events: ReplayEvent[]; onPick: 
   );
 }
 
-function Trades({ open, closed, digits }: { open: Trade[]; closed: Trade[]; digits: number }) {
+function Debugger({ t, digits, strategy, replay }: { t: Trade | null; digits: number; replay: (id: number) => void;
+  strategy?: { name?: string; version?: string; param_hash?: string; experimental?: boolean } }) {
+  if (!t) return <p className="dim">Click a BUY / SELL / EXIT marker or a trade row.</p>;
+  const f = (x?: number | null) => (x === null || x === undefined ? "–" : x.toFixed(digits));
+  const m = (x?: number | null) => (x === null || x === undefined ? "–" : x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+  const open = !t.exit_time;
+  return (
+    <div className="debugger">
+      <div className="hdr"><b>#{t.id} {t.side > 0 ? "LONG ▲" : "SHORT ▼"} {t.lots} lot</b>
+        <span className="dim"> · {strategy?.name} v{t.strategy_version ?? strategy?.version} · params {t.param_hash ?? strategy?.param_hash}</span>
+        {strategy?.experimental && <span className="sev high">experimental</span>}</div>
+      <table className="mono"><tbody>
+        <tr><td>Signal</td><td>{t.entry_signal ?? t.reason} · decided at the close of {t.decided_time?.replace("T", " ")}</td></tr>
+        <tr><td>Entry</td><td>{t.entry_time?.replace("T", " ")} @ {f(t.entry_price)} (next open + costs)</td></tr>
+        <tr><td>Initial SL / TP</td><td>{f(t.initial_sl)} / {f(t.tp)}</td></tr>
+        <tr><td>Exit</td><td>{open ? "open" : `${t.exit_time?.replace("T", " ")} @ ${f(t.exit_price)} · ${t.exit_reason}`}</td></tr>
+        {!open && <tr><td>Result</td><td className={(t.net ?? 0) >= 0 ? "up" : "dn"}>{m(t.net)} (gross {m(t.gross)}, commission {m(t.commission)}) · R {t.r_multiple ?? "–"}</td></tr>}
+        <tr><td>MFE / MAE</td><td>{f(t.mfe)} / {f(t.mae)} pts{t.mfe_money !== undefined && t.mfe_money !== null ? ` · ${m(t.mfe_money)} / ${m(t.mae_money)}` : ""}</td></tr>
+      </tbody></table>
+      <div className="conds">{(t.conditions ?? []).map((c, i) => <div key={i} className={c.passed ? "ok" : "no"}>{c.passed ? "✅" : "❌"} {c.name}{c.value !== undefined && c.value !== null ? <span className="dim"> · {typeof c.value === "object" ? JSON.stringify(c.value) : String(c.value)}</span> : null}</div>)}</div>
+      {(t.sl_moves?.length ?? 0) > 0 && <div className="moves"><b>Trailing stop</b>{t.sl_moves!.map((x, i) => <div key={i} className="mono">{x.time.replace("T", " ").slice(5, 16)} · {f(x.old)} → {f(x.new)}</div>)}</div>}
+      {(t.blocked_steps?.length ?? 0) > 0 && <div className="moves dim"><b>Blocked steps (replay trade management OFF)</b>{t.blocked_steps!.map((x, i) => <div key={i} className="mono">{x.time.replace("T", " ").slice(5, 16)} · would be {f(x.new)}</div>)}</div>}
+      <button className="primary" onClick={() => replay(t.id)} title="Restart from the same data and pause 8 candles before this trade was decided">⟲ Replay this trade</button>
+    </div>
+  );
+}
+
+function Trades({ open, closed, digits, onPick }: { open: Trade[]; closed: Trade[]; digits: number; onPick: (t: Trade) => void }) {
   if (!open.length && !closed.length) return <p className="dim">No virtual trades (indicator replay, or no entry yet).</p>;
   return (
     <table className="trades mono"><thead><tr><th>#</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Exit</th><th>Net</th></tr></thead>
       <tbody>
-        {open.map((t) => <tr key={`o${t.id}`} className="open"><td>{t.id}</td><td>{t.side > 0 ? "BUY" : "SELL"} {t.lots}</td><td>{t.entry_price?.toFixed(digits)}</td><td>{t.sl?.toFixed(digits) ?? "–"}</td><td>{t.tp?.toFixed(digits) ?? "–"}</td><td>open</td><td>–</td></tr>)}
-        {closed.slice(-50).reverse().map((t) => <tr key={`c${t.id}`}><td>{t.id}</td><td>{t.side > 0 ? "BUY" : "SELL"} {t.lots}</td><td>{t.entry_price?.toFixed(digits)}</td><td>{t.sl?.toFixed(digits) ?? "–"}</td><td>{t.tp?.toFixed(digits) ?? "–"}</td><td title={t.exit_reason ?? ""}>{t.exit_price?.toFixed(digits)}</td><td className={(t.net ?? 0) >= 0 ? "up" : "dn"}>{fmt(t.net)}</td></tr>)}
+        {open.map((t) => <tr key={`o${t.id}`} className="open" onClick={() => onPick(t)}><td>{t.id}</td><td>{t.side > 0 ? "BUY" : "SELL"} {t.lots}</td><td>{t.entry_price?.toFixed(digits)}</td><td>{t.sl?.toFixed(digits) ?? "–"}</td><td>{t.tp?.toFixed(digits) ?? "–"}</td><td>open</td><td>–</td></tr>)}
+        {closed.slice(-50).reverse().map((t) => <tr key={`c${t.id}`} onClick={() => onPick(t)}><td>{t.id}</td><td>{t.side > 0 ? "BUY" : "SELL"} {t.lots}</td><td>{t.entry_price?.toFixed(digits)}</td><td>{t.sl?.toFixed(digits) ?? "–"}</td><td>{t.tp?.toFixed(digits) ?? "–"}</td><td title={t.exit_reason ?? ""}>{t.exit_price?.toFixed(digits)}</td><td className={(t.net ?? 0) >= 0 ? "up" : "dn"}>{fmt(t.net)}</td></tr>)}
       </tbody></table>
   );
 }

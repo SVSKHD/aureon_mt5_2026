@@ -103,6 +103,10 @@ def token() -> int:
 def check(tok) -> str | None:
     """Called immediately before every management order is sent. None = allowed, else the refusal."""
     _ensure()
+    import guardian
+    why = guardian.order_block()                                   # wrong account / recovering: fail closed
+    if why:
+        return why
     with _lock:
         if not _s["enabled"]:
             return "trade management is OFF (/trade_management enable)"
@@ -179,6 +183,12 @@ def status_text() -> str:
         lines.append(f"Last change {_s['changed_at']} by {_s['changed_by'] or 'restart policy'}")
     if _s["problem"]:
         lines.append(f"⚠️ state problem at startup: {_s['problem']}")
+    import guardian
+    g = guardian.current()
+    if g is not None:
+        snap = g.snapshot()
+        lines.append(f"**MT5 connection: {snap['state']}**" + (f" ({snap['cause']})" if snap["cause"] != "ok" else "")
+                     + f" · account {snap['account']} · orders {snap['orders']}")
     return "\n".join(lines)
 
 

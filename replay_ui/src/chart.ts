@@ -19,10 +19,12 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { Bar, ReplayEvent, Trade } from "./types";
+import { CloudView, type CloudData } from "./cloud";
 
 export const THEME = {
   bg: "#131722", grid: "#1e222d", text: "#d1d4dc", border: "#2a2e39", up: "#26a69a", down: "#ef5350",
   ema8: "#f5c542", ema32: "#42a5f5", ema200: "#e040fb", sl: "#ef5350", tp: "#26a69a", entry: "#b2b5be",
+  ema20: "#80deea", ema50: "#ffcc80",
 };
 
 // chart time = the broker SERVER wall clock (the axis reads like the MT5 chart); readouts also show UTC and IST
@@ -49,7 +51,7 @@ function markerFor(e: ReplayEvent): SeriesMarker<Time> {
     CROSS: "X", CROSS_AFTER_TREND: "X✔", FAST_X_TREND: "8×200", SLOW_X_TREND: "32×200", PARALLEL_TREND: "‖200",
     "PRE-CROSS": "pre", "PRE-CROSS FAILED": "pre✕", "GAP PEAKED": "peak", "PULLBACK FAILED": "pb✕",
     "GAP WIDENING": "wid", "PARALLEL RUNNING": "par", "WIDE GAP": "wide", "PULLBACK STARTED": "pb", "RE-ENTRY": "re",
-    NARROW_ZONE_START: "chop", NARROW_ZONE_END: "chop✓",
+    NARROW_ZONE_START: "chop", NARROW_ZONE_END: "chop✓", EMA20_50_CROSS: "20/50",
   };
   return {
     time: t, id: String(e.seq), position: up ? "belowBar" : "aboveBar", shape: strong ? (up ? "arrowUp" : "arrowDown") : "circle",
@@ -67,6 +69,9 @@ export class ReplayChart {
   candles: ISeriesApi<"Candlestick">;
   ema: Record<"ema8" | "ema32" | "ema200", ISeriesApi<"Line">>;
   volume: ISeriesApi<"Histogram"> | null = null;
+  cloud: ISeriesApi<"Custom", Time, CloudData>;              // EMA20/50 cloud (behind the candles)
+  cloudLines: Record<"ema20" | "ema50", ISeriesApi<"Line">> | null = null;
+  private pendingJump: number | null = null;
   markers: ISeriesMarkersPluginApi<Time>;
   private allMarkers: SeriesMarker<Time>[] = [];
   private bars = new Map<number, Bar>();          // chart time -> bar (crosshair readout)
@@ -92,6 +97,7 @@ export class ReplayChart {
         shiftVisibleRangeOnNewBar: true },
       localization: { locale: "en-GB" },
     });
+    this.cloud = this.chart.addCustomSeries(new CloudView(), {}) as unknown as ISeriesApi<"Custom", Time, CloudData>;
     this.candles = this.chart.addSeries(CandlestickSeries, {
       upColor: THEME.up, downColor: THEME.down, borderVisible: false, wickUpColor: THEME.up, wickDownColor: THEME.down,
     });
@@ -136,6 +142,16 @@ export class ReplayChart {
     for (const k of ["ema8", "ema32", "ema200"] as const)
       this.ema[k].setData(warmup.filter((b) => b[k] !== undefined).map((b) => ({ time: toTime(b.time), value: b[k]! })));
     this.volume?.setData(warmup.filter((b) => b.volume !== undefined).map((b) => this.vol(b)));
+    const withCloud = warmup.filter((b) => b.ema20 !== undefined && b.ema50 !== undefined);
+    if (withCloud.length) {
+      this.ensureCloudLines();
+      this.cloud.setData(withCloud.map((b) => ({ time: toTime(b.time), fast: b.ema20!, slow: b.ema50! })));
+      this.cloudLines!.ema20.setData(withCloud.map((b) => ({ time: toTime(b.time), value: b.ema20! })));
+      this.cloudLines!.ema50.setData(withCloud.map((b) => ({ time: toTime(b.time), value: b.ema50! })));
+    } else {
+      this.cloud.setData([]);
+      if (this.cloudLines) { this.cloudLines.ema20.setData([]); this.cloudLines.ema50.setData([]); }
+    }
     for (const b of warmup) this.bars.set(toTime(b.time), b);
     this.lastTime = warmup.length ? toTime(warmup[warmup.length - 1].time) : 0;
     this.chart.timeScale().scrollToRealTime();
@@ -157,6 +173,12 @@ export class ReplayChart {
       this.candles.update(this.candle(b));
       for (const k of ["ema8", "ema32", "ema200"] as const) if (b[k] !== undefined) this.ema[k].update({ time: t, value: b[k]! });
       if (this.volume && b.volume !== undefined) this.volume.update(this.vol(b));
+      if (b.ema20 !== undefined && b.ema50 !== undefined) {
+        this.ensureCloudLines();
+        this.cloud.update({ time: t, fast: b.ema20, slow: b.ema50 });
+        this.cloudLines!.ema20.update({ time: t, value: b.ema20 });
+        this.cloudLines!.ema50.update({ time: t, value: b.ema50 });
+      }
       this.bars.set(t, b);
       this.lastTime = t;
       this.stats.updates++;
@@ -173,6 +195,11 @@ export class ReplayChart {
         this.tradeLines(e);
       }
       this.markers.setMarkers(this.showSignals ? this.allMarkers : this.allMarkers.filter((m) => !this.signalMarkers.has(m)));
+    }
+    if (this.pendingJump !== null && this.lastTime >= this.pendingJump) {
+      const target = this.pendingJump;
+      this.pendingJump = null;
+      this.scrollToTime(target);
     }
     const dt = performance.now() - t0;
     this.stats.batches++;
@@ -215,8 +242,25 @@ export class ReplayChart {
   jumpToLatest() {
     this.chart.timeScale().scrollToRealTime();
   }
+  private ensureCloudLines() {
+    if (this.cloudLines) return;
+    const line = (color: string) => this.chart.addSeries(LineSeries, {
+      color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+    });
+    this.cloudLines = { ema20: line(THEME.ema20), ema50: line(THEME.ema50) };
+  }
+
+  /** Scroll to a candle; if the engine has not revealed it yet, scroll as soon as it has (never earlier). */
   jumpTo(serverIso: string) {
     const t = toTime(serverIso);
+    if (t > this.lastTime) {
+      this.pendingJump = t;
+      return;
+    }
+    this.scrollToTime(t);
+  }
+
+  private scrollToTime(t: number) {
     const idx = this.candles.data().findIndex((d) => (d.time as number) >= t);
     if (idx < 0) return;
     const r = this.chart.timeScale().getVisibleLogicalRange();

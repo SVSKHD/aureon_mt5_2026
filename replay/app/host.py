@@ -75,6 +75,7 @@ class Host:
         self.prepared: api.Prepared | None = None
         self.ui = {}                                      # pick_csv / fullscreen / open_path, set by the Qt window
         self._last_discord = 0.0
+        self._last_status = 0.0
         self._finishing = False
         self._t0 = None
 
@@ -92,6 +93,9 @@ class Host:
         b = self.feed.drain()
         if b:
             self.send(b)
+        if self.ctl and self.ctl.session and time.monotonic() - self._last_status > 1.0:
+            self._last_status = time.monotonic()
+            self._write_status()
         if self.prepared and self.prepared.discord and time.monotonic() - self._last_discord > 1.0:
             self._last_discord = time.monotonic()
             self.send({"type": "discord", "status": self.prepared.discord.status()})
@@ -121,6 +125,13 @@ class Host:
                 self.ctl.step()
             elif name == "speed" and self.ctl:
                 self.ctl.set_speed(cmd.get("value"))
+            elif name == "jump" and self.ctl:
+                self.jump(str(cmd.get("time", "")))
+            elif name == "replay_trade" and self.ctl:
+                self.replay_trade(int(cmd.get("trade_id")), int(cmd.get("before", 8)))
+            elif name == "compare" and self.prepared:
+                threading.Thread(target=self._compare, args=(cmd.get("strategies"),), daemon=True,
+                                 name="replay-compare").start()
             elif name in self.ui:
                 self.ui[name](cmd)
         except Exception as e:
@@ -163,6 +174,59 @@ class Host:
         self._t0 = time.monotonic()
         self.ctl.start()
 
+    def _run_to(self, index: int):
+        """Evaluate up to `index` (restarting a fresh, identical session when it is behind us) and pause there."""
+        behind = index < self.ctl.session.next
+        self.ctl.run_to(index)
+        if behind:
+            self._session_msg()
+
+    def jump(self, when: str):
+        """Jump to a date: ahead of the replay -> evaluate every candle up to it (nothing skipped) and pause; already
+        revealed -> the chart scrolls there. Never reveals a candle after the target."""
+        import pandas as pd
+        s = self.ctl.session
+        t = pd.Timestamp(when.replace("T", " "))
+        idx = int((s.ds.df["time"] <= t).sum()) - 1
+        idx = max(s.ds.first_index, min(idx, s.ds.last_index))
+        if idx >= s.next:
+            self._run_to(idx)
+        self.post({"type": "jump_view", "time": s.ds.df["time"].iloc[idx].isoformat()})
+
+    def replay_trade(self, trade_id: int, before: int = 8):
+        """Go back to `before` candles ahead of the candle that decided trade `trade_id`, paused, ready to step."""
+        s = self.ctl.session
+        tr = next((t for t in s.broker.closed + s.broker.open if t.id == trade_id), None)
+        if tr is None or tr.decided_index is None:
+            raise ValueError(f"trade {trade_id} is not known in this session")
+        target = max(s.ds.first_index, tr.decided_index - before)
+        self._run_to(target)
+        self.post({"type": "focus_trade", "trade_id": trade_id, "decided_time": tr.decided_time,
+                   "jump_time": s.ds.df["time"].iloc[target].isoformat()})
+
+    def _compare(self, names):
+        from replay import compare
+        try:
+            p = self.prepared
+            rep = compare.run(p.ds, names or compare.DEFAULT_SET, protective=p.req.protective or None,
+                              costs=p.session.s.costs, balance=p.req.balance, trade_management=p.req.trade_management,
+                              spec=p.spec)
+            import os
+            files = compare.write(rep, os.path.join(p.folder, "compare"))
+            with open(files["summary"], encoding="utf-8") as f:
+                self.post({"type": "report", "summary": f.read(), "files": files, "report": {"comparison": True}})
+        except Exception as e:
+            log.exception("comparison failed")
+            self.post({"type": "error", "text": f"comparison: {e}"})
+
+    def _write_status(self):
+        s = self.ctl.session
+        api.write_status({"state": self.ctl.state, "session": s.id, "symbol": s.ds.symbol, "tf": s.ds.tf,
+                          "strategy": s.strategy.name, "version": s.strategy.version, "done": s.done, "total": s.total,
+                          "hist_time": s.ds.df["time"].iloc[max(s.ds.first_index, s.next - 1)].isoformat(),
+                          "trade_management": s.broker.trade_management,
+                          "discord": self.prepared.discord.status() if self.prepared and self.prepared.discord else None})
+
     def _session_msg(self, s=None):
         s = s or (self.ctl.session if self.ctl else None)
         if s is None:
@@ -174,6 +238,8 @@ class Host:
 
     def _on_state(self, st, ctl):
         self.post({"type": "state", "state": st, "error": ctl.error})
+        if ctl.session is not None:
+            self._write_status()
         if st in ("finished", "stopped") and not self._finishing:
             self._finishing = True
             threading.Thread(target=self._finish, daemon=True, name="replay-report").start()
@@ -195,3 +261,5 @@ class Host:
     def shutdown(self):
         if self.ctl:
             self.ctl.stop()
+            if self.ctl.session is not None:
+                self._write_status()

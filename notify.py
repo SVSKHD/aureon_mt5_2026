@@ -293,7 +293,7 @@ def _worker():
             status = notifier.send(job["msg"], route=job["route"], only=job.get("only"), attempts=2)
         except Exception as e:                                    # never kill the thread
             log.exception("notify dispatch failed")
-            status = {n: "failed" for n in job["route"]} or {"?": f"failed: {type(e).__name__}"}
+            status = {n: "failed" for n in (job["route"] or notifier.configured())} or {"?": f"failed: {type(e).__name__}"}
         _results.put((job, status))
         _jobs.task_done()
 
@@ -306,6 +306,14 @@ def dispatch(job: dict):
         _thread.start()
     _inflight.add(job["id"])
     _jobs.put(job)
+
+
+def send_async(msg, by: str = "async") -> str:
+    """Post a card from the dispatch thread (the caller never waits on the network). Failures land in the standard
+    retry queue when tick() applies the result. Used for Guardian cards (never block MT5 polling)."""
+    jid = f"{by}:{uuid.uuid4().hex[:10]}"
+    dispatch({"id": jid, "purpose": "async", "msg": redact(msg), "route": None})
+    return jid
 
 
 def wait_idle(timeout: float = 10.0) -> bool:
@@ -333,7 +341,9 @@ def _apply_results(state):
             state.queue(job["msg"], owed)                         # the standard retry queue takes it from here
         ns()["flushing"].pop(job["id"], None)
         save()
-        audit({"event_id": job["id"], "kind": "NOTIFY_DIGEST", "symbol": job["msg"].get("symbol"), "action": "flushed",
+        audit({"event_id": job["id"], "kind": job["msg"].get("kind", "NOTIFY_DIGEST") if isinstance(job["msg"], dict) else "TEXT",
+               "symbol": job["msg"].get("symbol") if isinstance(job["msg"], dict) else None,
+               "action": "flushed" if job["purpose"] == "digest" else "sent_async",
                "mode": mode(), "items": job.get("items"), "services": job["route"], **_status_row(status)})
 
 
