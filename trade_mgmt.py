@@ -103,6 +103,10 @@ def token() -> int:
 def check(tok) -> str | None:
     """Called immediately before every management order is sent. None = allowed, else the refusal."""
     _ensure()
+    import guardian
+    why = guardian.order_block()                                   # wrong account / recovering: fail closed
+    if why:
+        return why
     with _lock:
         if not _s["enabled"]:
             return "trade management is OFF (/trade_management enable)"
