@@ -237,6 +237,41 @@ COMMAND_MAX_AGE = 10            # a trade command older than this many seconds i
 FAIL_NOTICE_COOLDOWN = 1800     # seconds between repeat "service X failed" notices
 MAX_PENDING = 2000              # undelivered messages kept for retry (older ones are summarised, never silently dropped)
 
+# ---- notification intelligence (notify.py). standard = exactly the behaviour before 1.7.3 (the default).
+# intelligent = severity, grouping, rate limits, digests. monitor = informational events on one live Discord card
+# per symbol. Critical events are ALWAYS sent at once in every mode. The mode can be switched with /notify_mode
+# (persisted in logs/state/notify.json); this .env value is only the starting default.
+NOTIFY_MODES = ("standard", "intelligent", "monitor")
+NOTIFY_MODE = env("NOTIFY_MODE", "standard").strip().lower()
+NOTIFY_QUIET_HOURS = env("NOTIFY_QUIET_HOURS")                    # "23:00-07:00" in TIMEZONE (IST); empty = off
+NOTIFY_DIGEST_MINUTES = env("NOTIFY_DIGEST_MINUTES", "30")        # low-priority digest interval
+NOTIFY_GROUP_SECONDS = env("NOTIFY_GROUP_SECONDS", "60")          # normal events of one symbol are grouped this long
+NOTIFY_RATE_MAX = env("NOTIFY_RATE_MAX", "8")                     # immediate non-critical cards per symbol ...
+NOTIFY_RATE_WINDOW_SECONDS = env("NOTIFY_RATE_WINDOW_SECONDS", "600")   # ... per this window; the rest is grouped
+NOTIFY_DUPLICATE_SECONDS = env("NOTIFY_DUPLICATE_SECONDS", "600")  # identical non-critical card within this = dropped
+# lowest severity each service carries in intelligent/monitor mode (critical always goes to every enabled service)
+NOTIFY_MIN_SEVERITY = {"Discord": env("NOTIFY_MIN_SEVERITY_DISCORD", "low").lower(),
+                       "Slack": env("NOTIFY_MIN_SEVERITY_SLACK", "high").lower(),
+                       "Ntfy": env("NOTIFY_MIN_SEVERITY_NTFY", "high").lower()}
+NOTIFY_DISABLED_SERVICES = {x.strip().capitalize() for x in env("NOTIFY_DISABLED_SERVICES").replace(";", ",").split(",")
+                            if x.strip()}                          # e.g. Slack  (intelligent/monitor mode only)
+NOTIFY_SYMBOL_PREFS = env("NOTIFY_SYMBOL_PREFS")                  # "XAGUSD:min=high,XAUUSD:min=normal"
+NOTIFY_ASSEMBLER_EXPORT = env("NOTIFY_ASSEMBLER_EXPORT", "0") == "1"   # also write the audit as "notification" records
+
+# ---- trade management (trade_mgmt.py): may the bot itself send management orders (the stepped trailing stop, the
+# Apply button)? OFF by default. Independent of PLACE_ENABLED (/place, Close) and of TSL_MODE (auto | suggest).
+# /trade_management enable (with a Confirm) / disable changes it at run time; the value is persisted, but an ENABLED
+# value is restored after a restart only with TRADE_MANAGEMENT_RESTORE_ENABLED=1 (or TRADE_MANAGEMENT_ENABLED=true).
+TRADE_MANAGEMENT_RAW = env("TRADE_MANAGEMENT_ENABLED", "false").strip().lower()
+TRADE_MANAGEMENT_ENABLED = TRADE_MANAGEMENT_RAW in ("1", "true", "yes", "on")
+TRADE_MANAGEMENT_MALFORMED = TRADE_MANAGEMENT_RAW not in ("1", "true", "yes", "on", "0", "false", "no", "off", "")
+TRADE_MANAGEMENT_RESTORE_ENABLED = env("TRADE_MANAGEMENT_RESTORE_ENABLED") == "1"
+try:            # optional: only these users may change it (they must ALSO be in DISCORD_ALLOWED_USER_IDS)
+    TRADE_MANAGEMENT_USER_IDS = {int(x) for x in env("TRADE_MANAGEMENT_USER_IDS").replace(";", ",").split(",") if x.strip()}
+except ValueError:
+    TRADE_MANAGEMENT_USER_IDS = {-1}                               # malformed: nobody (fail closed)
+TRADE_MANAGEMENT_CONFIRM_SECONDS = 30
+
 # ---------------------------------------------------------------- folders
 # Everything the bot writes lives under logs/ (override root with AUREON_DATA):
 #   logs/state/    state.json(.bak), alerts.json(.bak), heartbeat.json, watchdog.lock
@@ -263,6 +298,9 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 ALERTS_FILE = os.path.join(STATE_DIR, "alerts.json")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 DISCORD_MESSAGES_FILE = os.path.join(STATE_DIR, "discord_messages.json")   # written by the Discord thread only
+NOTIFY_STATE_FILE = os.path.join(STATE_DIR, "notify.json")                 # notify.py: mode, buffers (bot loop only)
+TRADE_MANAGEMENT_FILE = os.path.join(STATE_DIR, "trade_management.json")   # trade_mgmt.py (bot loop only)
+NOTIFY_AUDIT_DIR = os.path.join(DATA_DIR, "notify")                        # audit-YYYY-MM.jsonl (NOT a record file)
 WATCHDOG_LOCK = os.path.join(STATE_DIR, "watchdog.lock")
 
 
@@ -310,6 +348,37 @@ def migrate_legacy_files():
         os.rmdir(old_inbox)
 
 
+SEVERITIES = ("low", "normal", "high", "critical")
+
+
+def notify_problems() -> list[str]:
+    """Problems in the NOTIFY_* settings (empty = fine)."""
+    import re
+    bad = []
+    if NOTIFY_MODE not in NOTIFY_MODES:
+        bad.append(f"NOTIFY_MODE must be one of {', '.join(NOTIFY_MODES)}")
+    for key in ("NOTIFY_DIGEST_MINUTES", "NOTIFY_GROUP_SECONDS", "NOTIFY_RATE_MAX", "NOTIFY_RATE_WINDOW_SECONDS",
+                "NOTIFY_DUPLICATE_SECONDS"):
+        try:
+            if float(globals()[key]) <= 0:
+                raise ValueError
+        except ValueError:
+            bad.append(f"{key} must be a number greater than 0")
+    if NOTIFY_QUIET_HOURS and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d", NOTIFY_QUIET_HOURS):
+        bad.append("NOTIFY_QUIET_HOURS must be 'HH:MM-HH:MM' or empty")
+    for svc, sev in NOTIFY_MIN_SEVERITY.items():
+        if sev not in SEVERITIES:
+            bad.append(f"NOTIFY_MIN_SEVERITY_{svc.upper()} must be one of {', '.join(SEVERITIES)}")
+    for s in NOTIFY_DISABLED_SERVICES:
+        if s not in ("Discord", "Slack", "Ntfy"):
+            bad.append(f"NOTIFY_DISABLED_SERVICES: unknown service {s!r} (Discord, Slack, Ntfy)")
+    for part in (x.strip() for x in NOTIFY_SYMBOL_PREFS.replace(";", ",").split(",") if x.strip()):
+        m = re.fullmatch(r"([A-Za-z0-9._]+):min=(\w+)", part)
+        if not m or m.group(1).upper() not in SYMBOLS or m.group(2).lower() not in SEVERITIES:
+            bad.append(f"NOTIFY_SYMBOL_PREFS: cannot read {part!r} (SYMBOL:min=low|normal|high|critical)")
+    return bad
+
+
 def validate(symbol_check=None) -> list[str]:
     """Human-readable config problems (empty = fine). Checked once at startup.
     symbol_check(broker_name) -> None if the symbol is in Market Watch, else the reason (bot passes an MT5 probe)."""
@@ -349,6 +418,7 @@ def validate(symbol_check=None) -> list[str]:
         bad.append("EMA periods must be FAST < SLOW < TREND")
     if PLACE_ENABLED and not (DISCORD_BOT_TOKEN and DISCORD_ALLOWED_USER_IDS):
         bad.append("PLACE_ENABLED=1 needs DISCORD_BOT_TOKEN and DISCORD_ALLOWED_USER_IDS (who may place orders)")
+    bad += notify_problems()
     if WARMUP_BARS < 3 * EMA_TREND:
         bad.append("WARMUP_BARS must be at least 3x EMA_TREND or EMA200 will not match the chart")
     if SERVER_UTC_OFFSET_HOURS is None and SERVER_TZ:
