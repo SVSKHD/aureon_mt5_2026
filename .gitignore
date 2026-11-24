@@ -7,3 +7,4 @@ __pycache__/
 ./logs
 ./.idea
 
+replay_ui/node_modules/

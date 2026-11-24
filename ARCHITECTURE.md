@@ -16,7 +16,7 @@ stop-loss (never widening, never removing). All order code is in `trader.py`; `/
 ```
 pip install -r requirements.txt
 put at least one delivery line in .env (see ".env keys" below)
-python -m unittest discover -s tests      # 210 offline tests, no MT5 or internet needed
+python -m unittest discover -s tests      # offline tests, no MT5 or internet needed
 python bot.py --check-time                # during market hours: shows the MT5 clock the bot uses
 python watchdog.py                        # run this, never bot.py directly (it also auto-updates)
 ```
@@ -26,6 +26,7 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | File | Owns | Must NOT do |
 |---|---|---|
 | `config.py` | every setting, `.env` reading, the `SYMBOLS` table, `validate()` | hold logic |
+| `signal_engine.py` | the pure candle → events pipeline (indicators, events, dedupe key), shared by the bot and the Replay Lab | call MT5 |
 | `signals.py` | MT5 candle/tick reads, EMAs, cross + EMA200 events (`detect()`), the MT5 clock | send messages, write files |
 | `labels.py` | the label engine: bad-tick guard, Wilder ATR, trend phases, pullbacks, pre-cross, TSL steps | call MT5 (pure functions) |
 | `notifier.py` | Discord/Slack/ntfy delivery, channel routing, retry queue, outbox, `State` (JSON) | call MT5, decide what to alert |
@@ -46,6 +47,8 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | `bot.py` | the loop and its stages | indicator math, webhook code |
 | `updater.py` | git fetch / fast-forward / rollback, notices | touch positions |
 | `watchdog.py` | starts `bot.py`, restarts it, runs updates and the 90 s health check | anything else |
+| `replay/` | Replay Lab: historical data, replay engine, virtual broker, strategies, replay Discord, reports, desktop app | trade, touch live state or live channels |
+| `replay_ui/` | the replay chart UI source (React + TypeScript + Lightweight Charts), built into `replay/app/web/` | compute market values |
 | `tests/` | fake MT5 + regression and golden tests | touch real `.env`, logs, terminal |
 
 Runtime data lives in `logs/`: `state/`, `inbox/` and `outbox/` (Discord thread ↔ loop), `alerts/`, `trades/`,
@@ -257,6 +260,11 @@ the URL or the token.
 `NOTIFY_MODE` standard (default, unchanged delivery) | intelligent | monitor, and `TRADE_MANAGEMENT_ENABLED`
 (default **false**: the bot no longer moves stops by itself unless this is enabled). Full description, `.env` keys,
 examples and rollback: [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
+
+## Replay Lab (unreleased)
+
+`python -m replay app` (desktop window) / `python -m replay --help` (headless). Simulation only, its own
+`REPLAY_*` settings, nothing shared with the live loop. See [docs/REPLAY_LAB.md](docs/REPLAY_LAB.md).
 
 ## Known limits (by design)
 

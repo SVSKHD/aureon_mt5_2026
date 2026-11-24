@@ -1,0 +1,9 @@
+Aureon Replay Lab — third-party notices for this user interface
+
+TradingView Lightweight Charts™
+Copyright (с) 2025 TradingView, Inc. https://www.tradingview.com/
+Licensed under the Apache License, Version 2.0 (lightweight-charts 5.2.1).
+The chart shows TradingView's attribution logo (layout.attributionLogo = true), which links to
+https://www.tradingview.com/, and the status bar of the app links to it as well.
+
+React / React DOM 19.2.9 — Copyright (c) Meta Platforms, Inc. and affiliates. MIT License.

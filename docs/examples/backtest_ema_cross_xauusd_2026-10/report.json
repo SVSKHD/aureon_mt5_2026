@@ -1,0 +1,301 @@
+{
+ "label": "HISTORICAL REPLAY",
+ "session": "rp-20261124-021446-24e8f7",
+ "symbol": "XAUUSD",
+ "tf": "M30",
+ "data": {
+  "symbol": "XAUUSD",
+  "tf": "M30",
+  "source": "csv-73391cd7ff",
+  "server_tz": "Europe/Athens",
+  "requested": [
+   "2026-10-01 00:00:00",
+   "2026-10-31 00:00:00"
+  ],
+  "actual": [
+   "2026-10-01 00:00:00",
+   "2026-10-30 23:30:00"
+  ],
+  "candles": 980,
+  "warmup_candles": 961,
+  "gaps": [
+   {
+    "start": "2026-10-01 01:30:00",
+    "end": "2026-10-01 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-02 01:30:00",
+    "end": "2026-10-02 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-03 01:30:00",
+    "end": "2026-10-05 04:00:00",
+    "missing": 100,
+    "kind": "weekend"
+   },
+   {
+    "start": "2026-10-06 01:30:00",
+    "end": "2026-10-06 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-07 01:30:00",
+    "end": "2026-10-07 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-08 01:30:00",
+    "end": "2026-10-08 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-09 01:30:00",
+    "end": "2026-10-09 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-10 01:30:00",
+    "end": "2026-10-12 04:00:00",
+    "missing": 100,
+    "kind": "weekend"
+   },
+   {
+    "start": "2026-10-13 01:30:00",
+    "end": "2026-10-13 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-14 01:30:00",
+    "end": "2026-10-14 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-15 01:30:00",
+    "end": "2026-10-15 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-16 01:30:00",
+    "end": "2026-10-16 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-17 01:30:00",
+    "end": "2026-10-19 04:00:00",
+    "missing": 100,
+    "kind": "weekend"
+   },
+   {
+    "start": "2026-10-20 01:30:00",
+    "end": "2026-10-20 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-21 01:30:00",
+    "end": "2026-10-21 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-22 01:30:00",
+    "end": "2026-10-22 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-23 01:30:00",
+    "end": "2026-10-23 04:00:00",
+    "missing": 4,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-24 01:30:00",
+    "end": "2026-10-26 02:00:00",
+    "missing": 96,
+    "kind": "weekend"
+   },
+   {
+    "start": "2026-10-27 00:30:00",
+    "end": "2026-10-27 02:00:00",
+    "missing": 2,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-28 00:30:00",
+    "end": "2026-10-28 02:00:00",
+    "missing": 2,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-29 00:30:00",
+    "end": "2026-10-29 02:00:00",
+    "missing": 2,
+    "kind": "daily_break"
+   },
+   {
+    "start": "2026-10-30 00:30:00",
+    "end": "2026-10-30 02:00:00",
+    "missing": 2,
+    "kind": "daily_break"
+   }
+  ],
+  "unexpected_gaps": 0,
+  "missing_candles_unexpected": 0,
+  "dropped_rows": 0,
+  "problems": [
+   "warm-up has 961 candles (wanted 1000)",
+   "unexpected gap 2026-09-08 00:00:00 \u2192 2026-09-08 04:00:00 (7 candles)"
+  ]
+ },
+ "candles_processed": 980,
+ "candles_in_range": 980,
+ "complete": true,
+ "bad_ticks_cleaned": 7,
+ "events_by_type": {
+  "CROSS": 23,
+  "CROSS_AFTER_TREND": 15,
+  "FAST_X_TREND": 18,
+  "GAP PEAKED": 4,
+  "GAP WIDENING": 32,
+  "NARROW_ZONE_END": 9,
+  "NARROW_ZONE_START": 13,
+  "PARALLEL RUNNING": 23,
+  "PARALLEL_TREND": 3,
+  "PRE-CROSS": 37,
+  "PRE-CROSS FAILED": 7,
+  "PULLBACK FAILED": 17,
+  "PULLBACK STARTED": 54,
+  "RE-ENTRY": 37,
+  "SLOW_X_TREND": 10,
+  "VIRTUAL_CLOSE": 38,
+  "VIRTUAL_OPEN": 38,
+  "VIRTUAL_SL_MOVED": 5,
+  "WIDE GAP": 4
+ },
+ "signal_events": 306,
+ "discord": {
+  "events": 0,
+  "queued": 0,
+  "attempted": 0,
+  "delivered": 0,
+  "failed": 0,
+  "digests": 0,
+  "events_in_digests": 0,
+  "skipped_severity": 0,
+  "enabled": false,
+  "waiting": 0,
+  "problem": null,
+  "rate_per_second": 5.0
+ },
+ "replay_seconds": 17.049,
+ "candles_per_second": 57.5,
+ "execution": {
+  "mode": "simulation",
+  "spec": {
+   "contract_size": 100.0,
+   "tick_size": 0.01,
+   "tick_value": 1.0,
+   "digits": 2,
+   "point": 0.01,
+   "volume_min": 0.01,
+   "volume_step": 0.01,
+   "volume_max": 100.0,
+   "currency": "USD",
+   "source": "default XAUUSD (100 oz, 0.01 = $1/lot)"
+  },
+  "costs": {
+   "spread": 0.3,
+   "commission_per_lot": 7.0,
+   "slippage": 0.05
+  },
+  "fills": "next candle open after the deciding close; bid prices; buys at ask = bid + spread; stop before target when one candle touches both; gaps through the stop fill at the open",
+  "trade_management": true
+ },
+ "performance": {
+  "strategy": {
+   "name": "ema_cross",
+   "trades": true,
+   "params": {},
+   "protective": {
+    "sl_mode": "atr",
+    "sl": 2.0,
+    "tp_mode": "r",
+    "tp": 2.0
+   },
+   "sizing": {
+    "mode": "fixed",
+    "lots": 1.0,
+    "risk_pct": 1.0,
+    "step_equity": 50000.0
+   }
+  },
+  "trades": 38,
+  "wins": 8,
+  "losses": 30,
+  "win_rate": 21.1,
+  "net": -21230.0,
+  "gross_profit": 29576.0,
+  "gross_loss": 50806.0,
+  "profit_factor": 0.582,
+  "avg_win": 3697.0,
+  "avg_loss": -1693.53,
+  "expectancy": -558.68,
+  "start_balance": 50000.0,
+  "end_balance": 28770.0,
+  "max_drawdown": 28503.0,
+  "max_drawdown_pct": 55.07,
+  "commission": 266.0,
+  "ambiguous_bars": 0,
+  "sl_moves": 5,
+  "blocked_sl_steps": 0,
+  "monthly": [
+   {
+    "month": "2026-10",
+    "trades": 38,
+    "net": -21230.0,
+    "win_rate": 21.1,
+    "return_pct": -42.46,
+    "start_balance": 50000.0
+   }
+  ],
+  "by_signal": {
+   "CROSS": {
+    "trades": 23,
+    "net": -5991.0,
+    "wins": 6
+   },
+   "CROSS_AFTER_TREND": {
+    "trades": 15,
+    "net": -15239.0,
+    "wins": 2
+   }
+  },
+  "distribution": {
+   "< -1000": 25,
+   "-1000..-500": 4,
+   "-500..-250": 0,
+   "-250..0": 1,
+   "0..250": 1,
+   "250..500": 0,
+   "500..1000": 0,
+   "> 1000": 7
+  },
+  "trade_management": true
+ },
+ "notice": "Simulated results on historical candles with the stated costs and fill policy. Not live results.",
+ "evaluation": "per candle, the live bot's window: the 1000 candles before it plus itself (signal_engine + labels); no later candle is used",
+ "animation": "closed-candle replay (no lower-timeframe history: intrabar movement is not invented)"
+}
