@@ -42,6 +42,13 @@ def card(ev: dict) -> dict:
         except Exception:                                          # an event without the fields the formatter needs
             msg = notifier.info(f"{ev['type']} {ev['dir']}", symbol=ev["symbol"], kind=ev["type"],
                                 fields=[("Price", f"{ev['price']}")])
+    elif ev["kind"] == "strategy":
+        d = ev.get("details") or {}
+        msg = notifier.info(f"{ev['type'].replace('_', ' ')} {ev['dir']}", symbol=ev["symbol"], kind=ev["type"],
+                            fields=[("Price", f"{ev['price']}"), ("Strategy", f"{ev.get('strategy')} v{d.get('version', '')}"
+                                     + (" (experimental)" if d.get("experimental") else "")),
+                                    ("EMA20 / EMA50", f"{d.get('ema20')} / {d.get('ema50')}"),
+                                    ("Market now", ev.get("status", ""), False)])
     else:
         d = ev.get("details") or {}
         tr = d.get("trade") or {}

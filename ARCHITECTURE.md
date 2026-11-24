@@ -33,6 +33,9 @@ python watchdog.py                        # run this, never bot.py directly (it 
 | `alerts.py` | price alerts, the signed command inbox, Discord slash commands, buttons, outbox poster | call MT5 or webhooks |
 | `positions.py` | position tracking, stepped TSL decisions, in-trade alerts, MAX POINT, `/positions` | send orders itself |
 | `monitor.py` | the live monitor card per symbol | anything else |
+| `guardian.py` | MT5 Connection Guardian: connection state, classification, account check, recovery decisions | send orders |
+| `terminal.py` | find / stop / start the ONE owned MT5 terminal (exact path) | touch any other terminal |
+| `ops.py` | the unified operational event schema; LIVE and REPLAY stores kept apart | block or raise |
 | `notify_events.py` | the notification event schema and the fixed severity table | decide routing, send |
 | `notify_policy.py` | the pure policy engine (send / group / digest / feed / duplicate) | touch files, network, MT5 |
 | `notify.py` | notification modes, held items, group/digest/feed cards (posted off the loop), audit, `/notify` | call MT5, send orders |
@@ -260,6 +263,11 @@ the URL or the token.
 `NOTIFY_MODE` standard (default, unchanged delivery) | intelligent | monitor, and `TRADE_MANAGEMENT_ENABLED`
 (default **false**: the bot no longer moves stops by itself unless this is enabled). Full description, `.env` keys,
 examples and rollback: [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
+
+## Connection Guardian + Replay Lab V2 (unreleased)
+
+See [docs/V2_GUARDIAN_REPLAY.md](docs/V2_GUARDIAN_REPLAY.md): MT5 Connection Guardian (`MT5_*` settings), new Discord
+commands, EMA 20/50 experimental strategy, trade debugger, strategy comparison, Windows validation checklist.
 
 ## Replay Lab (unreleased)
 

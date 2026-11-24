@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json, logging, os, time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import config as C
 from replay import data as D, report as R
 from replay.broker import Costs, spec_for
@@ -65,7 +65,7 @@ class Prepared:
             self.log.close()
         self.log = EventLog(self.folder)
         self.discord = ReplayDiscord(enabled=req.discord)
-        s.sinks += [self.log, self.discord]
+        s.sinks += [self.log, self.discord, ops_sink(s, self.folder)]
         with open(os.path.join(self.folder, "request.json"), "w", encoding="utf-8") as f:
             json.dump({**vars(req), "session": s.id}, f, indent=1, default=str)
         self.session = s
@@ -89,6 +89,43 @@ def prepare(req: Request, mt5=None) -> Prepared:
     p = Prepared(req, ds, spec, intrabar, note)
     p.fresh()
     return p
+
+
+def ops_sink(s: ReplaySession, folder: str):
+    """Every replay event as a unified operational event in the session's OWN store (never the live one)."""
+    import ops
+    store = ops.Store("REPLAY", folder=folder)
+
+    def sink(res):
+        for ev in res["events"]:
+            store.write(ops.OpsEvent(source="replay", type=ev["type"], mode="REPLAY", severity=ev.get("severity", "normal"),
+                                     symbol=ev["symbol"], strategy=ev.get("strategy") or s.strategy.name,
+                                     version=s.strategy.version, correlation_id=ev["key"], replay_session=s.id,
+                                     detail={"seq": ev["seq"], "kind": ev["kind"], "dir": ev["dir"], "price": ev["price"],
+                                             "bar_time": ev["bar_time"], "close_time": ev["close_time"]}))
+    return sink
+
+
+STATUS_FILE = os.path.join(C.DATA_DIR, "replay", "status.json")
+
+
+_status_lock = __import__("threading").Lock()
+
+
+def write_status(d: dict):
+    """The Replay Lab's status for the live bot's /replay_status (the bot only reads it). Atomic (unique temp file +
+    replace, under a lock: the engine and UI threads both write it), never raises."""
+    try:
+        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+        body = json.dumps({**d, "updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                           "pid": os.getpid()}, default=str)
+        with _status_lock:
+            tmp = f"{STATUS_FILE}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(tmp, STATUS_FILE)
+    except Exception:
+        log.exception("replay status write failed")
 
 
 def finish(p: Prepared, wall_seconds: float | None = None) -> tuple[dict, dict]:

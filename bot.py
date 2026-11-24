@@ -153,9 +153,10 @@ def _reconcile() -> dict:
 
 
 def _make_guardian() -> "guardian.Guardian":
-    return guardian.install(guardian.Guardian(mt5, clock=lambda: _mono(), server_now=lambda: signals.server_now(),
-                                              notify=lambda card: notify.send_async(card, "guardian"),
-                                              reconcile=_reconcile))
+    g = guardian.Guardian(mt5, clock=lambda: _mono(), server_now=lambda: signals.server_now(),
+                          notify=lambda card: notify.send_async(card, "guardian"), reconcile=_reconcile)
+    g.on_change = lambda: post_controls()                          # the status card follows the connection
+    return guardian.install(g)
 
 
 GUARD = _make_guardian()
@@ -693,7 +694,71 @@ JSON_COMMANDS: dict = {                                            # name -> han
     "notify": lambda req: notify.command(state, req),
     "notify_mode": lambda req: notify.set_mode(state, req),
     "trade_management": lambda req: trade_management_cmd(req),
+    "notification_mode": lambda req: (notify.set_mode(state, req) if req.get("mode") else notify.command(state, req)),
+    "mt5_health": lambda req: mt5_health_cmd(req),
+    "mt5_connection": lambda req: mt5_connection_cmd(req),
+    "mt5_reconnect": lambda req: mt5_reconnect_cmd(req),
+    "replay_status": lambda req: replay_status_cmd(req),
 }
+
+
+def mt5_health_cmd(req: dict) -> dict:
+    """/mt5_health: the Guardian's view right now (state, cause, account check, tick age, order permission)."""
+    g = GUARD.snapshot()
+    lines = [f"**MT5: {g['state']}**" + (f" · {g['cause']}" if g["cause"] != "ok" else "") + f" · for {g['for_seconds']} s",
+             f"Account: {g['account']} · orders: {g['orders']}",
+             f"Last tick: {g['tick_age_s']} s ago" if g["tick_age_s"] is not None else "Last tick: unknown",
+             f"Terminal restart: {g['restart']}" + (f" · cooldown {g['cooldown_s']} s" if g["cooldown_s"] else "")
+             + (f" · this outage: {g['outage_attempts']} reconnect attempts, {g['outage_restarts']} restarts"
+                if g["outage_attempts"] or g["outage_restarts"] else ""),
+             trade_mgmt.status_line(), notify.status_line()]
+    return {"ok": True, "text": "\n".join(lines), "buttons": trade_mgmt.buttons()}
+
+
+def mt5_connection_cmd(req: dict) -> dict:
+    """/mt5_connection: the health timeline (disconnections, attempts, restarts, recoveries)."""
+    rows = GUARD.timeline[-15:]
+    if not rows:
+        return {"ok": True, "text": "No connection events recorded yet."}
+    return {"ok": True, "text": "**MT5 connection timeline (UTC)**\n" + "\n".join(
+        f"`{r['ts'][5:19].replace('T', ' ')}` {r['from']} → **{r['state']}** · {r['cause']}"
+        + (f" · {r['detail'][:80]}" if r.get("detail") else "") for r in reversed(rows))}
+
+
+def mt5_reconnect_cmd(req: dict) -> dict:
+    """/mt5_reconnect: one API reconnect + account check NOW, from the bot loop. Never restarts the terminal (that
+    stays with the Guardian's rules) and never sends an order."""
+    if not alerts.may(req.get("user"), req.get("channel"), "trade"):
+        return {"ok": False, "text": "⛔ NOT done — this user is not explicitly listed in DISCORD_ALLOWED_USER_IDS."}
+    err = _connect()
+    problem = err or signals.health()
+    GUARD.observe(problem, attempts=_link["attempts"])
+    if problem is None:
+        _link_up()
+    log.warning("MT5 reconnect requested by %s -> %s", req.get("user"), problem or "ok")
+    return {"ok": problem is None, "text": (f"✅ Reconnected · MT5 {GUARD.state}" if problem is None else
+                                            f"❌ Still not connected: {problem} · MT5 {GUARD.state}")}
+
+
+def replay_status_cmd(req: dict) -> dict:
+    """/replay_status: what the Replay Lab (a separate program) last reported. Read-only; it never affects the bot."""
+    from notifier import load_json
+    path = os.path.join(C.DATA_DIR, "replay", "status.json")
+    d, _ = load_json(path, {})
+    if not d:
+        return {"ok": True, "text": "No replay has run on this PC yet (python -m replay app)."}
+    age = ""
+    try:
+        age = f" · updated {(datetime.now(timezone.utc) - datetime.fromisoformat(d['updated_utc'])).total_seconds():.0f} s ago"
+    except Exception:
+        pass
+    dc = d.get("discord") or {}
+    return {"ok": True, "text": f"**HISTORICAL REPLAY · {d.get('state', '?').upper()}**{age}\n"
+            f"{d.get('symbol')} {d.get('tf')} · {d.get('strategy')} v{d.get('version')} · candle {d.get('done')}/{d.get('total')}"
+            f" · at {str(d.get('hist_time', '')).replace('T', ' ')} (server)\n"
+            f"Replay trade management: {'ON (simulated)' if d.get('trade_management') else 'OFF'} · session {d.get('session')}\n"
+            f"Replay Discord: " + (f"delivered {dc.get('delivered')} / attempted {dc.get('attempted')} · failed {dc.get('failed')}"
+                                   if dc.get("enabled") else "off")}
 
 
 def trade_management_cmd(req: dict) -> dict:

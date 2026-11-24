@@ -64,3 +64,13 @@ label.chk { color: var(--text); }
 .modal .box { background: var(--panel); border: 1px solid var(--panel2); border-radius: 6px; padding: 16px; width: min(900px, 92vw); max-height: 86vh; display: flex; flex-direction: column; gap: 8px; }
 .modal pre { overflow: auto; flex: 1; font-size: 12px; white-space: pre-wrap; }
 .modal .files { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.trades tbody tr { cursor: pointer; } .trades tbody tr:hover { background: var(--panel2); }
+.debugger table { width: 100%; border-collapse: collapse; font-size: 11px; } .debugger td { padding: 1px 4px; vertical-align: top; }
+.debugger td:first-child { color: var(--dim); white-space: nowrap; }
+.debugger .hdr { margin-bottom: 4px; } .debugger .conds { margin: 6px 0; font-size: 11px; }
+.debugger .conds .no { color: var(--dn); } .debugger .moves { font-size: 11px; margin: 4px 0; }
+.debugger button { margin-top: 6px; width: 100%; }
+input[type="datetime-local"] { width: 170px; }
+
+.panel:has(.debugger) .body { max-height: 46vh; }

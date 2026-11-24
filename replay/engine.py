@@ -54,6 +54,14 @@ class ReplaySettings:
     spec: SymbolSpec | None = None
     window: int = C.WARMUP_BARS                  # candles before the evaluated one (the live bot's warm-up)
     session_id: str | None = None
+    extra_strategies: list = field(default_factory=list)   # compared in lockstep on the SAME evaluation
+
+
+@dataclass
+class Account:
+    """One strategy with its own virtual broker. Every account sees the same candles and the same events."""
+    strategy: Strategy
+    broker: VirtualBroker
 
 
 def _iso(ts) -> str:
@@ -67,9 +75,10 @@ class ReplaySession:
             raise ValueError("REPLAY_EXECUTION_MODE must be simulation")
         self.ds, self.s = ds, settings or ReplaySettings()
         self.id = self.s.session_id or f"rp-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
-        self.strategy = self.s.strategy or IndicatorsOnly()
         self.spec = self.s.spec or spec_for(ds.symbol)
-        self.broker = VirtualBroker(ds.symbol, self.spec, self.s.costs, self.s.balance, self.s.trade_management)
+        mk = lambda st: Account(st, VirtualBroker(ds.symbol, self.spec, self.s.costs, self.s.balance,
+                                                  self.s.trade_management))
+        self.accounts = [mk(self.s.strategy or IndicatorsOnly())] + [mk(st) for st in self.s.extra_strategies]
         self.intrabar = intrabar
         self.clock = clock
         self.next = ds.first_index                 # next candle to evaluate
@@ -84,6 +93,14 @@ class ReplaySession:
         self._last_lab = None
 
     # --------------------------------------------------------------------------------------- facts
+    @property
+    def strategy(self) -> Strategy:                 # the primary account (chart, report, Discord)
+        return self.accounts[0].strategy
+
+    @property
+    def broker(self) -> VirtualBroker:
+        return self.accounts[0].broker
+
     @property
     def total(self) -> int:
         return self.ds.last_index - self.ds.first_index + 1
@@ -122,8 +139,9 @@ class ReplaySession:
         """The candles before the range (already history at the replay start), with their EMAs from the same
         causal formula. Shown on the chart as context; never evaluated for events."""
         w = signal_engine.add_indicators(self.ds.df.iloc[:self.ds.first_index].copy())
+        extra = self.strategy.warmup_overlays(w)
         return [{**self.bar_payload(i), **{f"ema{p}": float(w[f"ema{p}"].iloc[i]) for p in
-                                           (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND)}} for i in range(len(w))]
+                                           (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND)}, **extra[i]} for i in range(len(w))]
 
     # ---------------------------------------------------------------------------------------- step
     def window(self, i: int) -> tuple[pd.DataFrame, int]:
@@ -163,11 +181,13 @@ class ReplaySession:
         if bool(bars["cleaned"].iloc[-1]):
             self.cleaned += 1
         bar = self.bar_payload(i, w)
+        bar.update(self.strategy.overlays(w))                               # e.g. EMA20/50 for the cloud
         t = self.times(i)
         status = labels.status_line(lab.state)
         trades = []
-        trades += self.broker.on_open(i, bar, self.strategy.name)          # orders decided at the last close
-        trades += self.broker.on_bar(i, bar)                                # stops / targets inside this candle
+        for a in self.accounts:
+            trades += [(a, x) for x in a.broker.on_open(i, bar, a.strategy.name)]   # decided at the last close
+            trades += [(a, x) for x in a.broker.on_bar(i, bar)]                     # stops / targets in this candle
         events = []
         for bt, e in signal_engine.candle_events(w, 1, lab):
             key = signal_engine.event_key(self.ds.symbol, self.ds.tf, bt, e)
@@ -175,18 +195,31 @@ class ReplaySession:
                 continue
             self.seen.add(key)
             events.append(self._event("signal", e["type"], e["dir"], float(e["price"]), key, t, status, e))
-        trades += self.broker.manage(i, bars, lo, lab, bar)                 # trailing stop, from candles <= i
         atr = (lab.state.last or {}).get("atr")
-        ctx = Context(i, {**bar, "next_open": t["close_time"]}, events, lab, atr, list(self.broker.open),
-                      self.broker.equity(bar["close"]), self.spec)
-        intents = self.strategy.on_close(ctx) if self.strategy.trades else []
-        if intents:
-            self.broker.submit(intents, bar["time"], self.strategy.name)
-        if self.finished and self.broker.open:
-            trades += self.broker.close_all(bar, "end of replay (marked to the last close)")
-        self.broker.mark(bar)
-        for tr in trades:
-            events.append(self._virtual(tr, t, status))
+        signal_events = list(events)
+        for a in self.accounts:
+            trades += [(a, x) for x in a.broker.manage(i, bars, lo, lab, bar)]    # trailing stop, candles <= i
+            ctx = Context(i, {**bar, "next_open": t["close_time"]}, signal_events, lab, atr, list(a.broker.open),
+                          a.broker.equity(bar["close"]), self.spec, w)
+            for se in a.strategy.strategy_events(ctx):
+                key = f"{self.ds.symbol}:{self.ds.tf}:{a.strategy.name}:{se['type']}:{se['dir']}:{bar['time']}"
+                if key not in self.seen:
+                    self.seen.add(key)
+                    ev = self._event("strategy", se["type"], se["dir"], se["price"], key, t, status, se.get("details", {}))
+                    ev["strategy"] = a.strategy.name
+                    events.append(ev)
+            intents = a.strategy.on_close(ctx) if a.strategy.trades else []
+            if intents:
+                a.broker.submit(intents, bar["time"], a.strategy.name, decided_index=i, version=a.strategy.version,
+                                param_hash=a.strategy.param_hash)
+            if self.finished and a.broker.open:
+                trades += [(a, x) for x in a.broker.close_all(bar, "end of replay (marked to the last close)")]
+            a.broker.mark(bar)
+        for a, tr in trades:
+            if a is self.accounts[0] or len(self.accounts) == 1:
+                events.append(self._virtual(tr, t, status))
+            else:                                                        # compared accounts: counted, not charted
+                self.counts[f"{a.strategy.name}:{tr['kind']}"] = self.counts.get(f"{a.strategy.name}:{tr['kind']}", 0) + 1
         res = {"session": self.id, "index": i, "done": self.done, "total": self.total, "bar": bar,
                "times": t, "events": events, "status": status, "equity": self.broker.equity(bar["close"]),
                "balance": self.broker.balance, "open_trades": [x.to_dict() for x in self.broker.open],
@@ -231,6 +264,7 @@ class ReplaySession:
         ev = self._base("virtual", tr["kind"], {1: "LONG", -1: "SHORT"}.get(side, ""), price,
                         f"{self.id}:trade{tid}:{tr['kind']}:{t['bar_time']}", t, status)
         ev["details"] = tr
+        ev["strategy"] = self.strategy.name
         ev["severity"] = "high"
         self.events.append(ev)
         self.counts[tr["kind"]] = self.counts.get(tr["kind"], 0) + 1
@@ -260,6 +294,8 @@ class ReplayController:
         self._steps = 0
         self._stop = False
         self._thread: threading.Thread | None = None
+        self.pause_at: int | None = None              # run_to(): pause once this candle has been evaluated
+        self._speed_before = None
 
     def _set(self, st):
         self.state = st
@@ -304,18 +340,37 @@ class ReplayController:
         with self._cv:
             self.speed = speed; self._cv.notify_all()
 
-    def stop(self, wait: float = 5.0):
+    def stop(self, wait: float = 5.0, silent: bool = False):
+        """Stop the worker. silent=True (a restart / run_to discarding the session) does not announce "stopped", so
+        the discarded session gets no report."""
         with self._cv:
             self._stop = True; self._cv.notify_all()
         t = self._thread
         if t and t is not threading.current_thread():
             t.join(wait)
-        if self.state not in ("finished", "error"):
+        if self.state not in ("finished", "error") and not silent:
             self._set("stopped")
+
+    def run_to(self, index: int):
+        """Evaluate every candle up to and including `index` at full speed, then pause there (jump to a date,
+        "replay this trade"). A target already behind us restarts a fresh, identical session from the first candle:
+        the engine is deterministic, so the same trades re-appear at the same candles."""
+        with self._cv:
+            behind = self.session is not None and index < self.session.next
+        if behind or self.session is None or self.state in ("finished", "stopped", "error", "idle"):
+            self.stop(silent=True)
+            self._thread = None
+            self.start(paused=True)
+        with self._cv:
+            if self.pause_at is None:
+                self._speed_before = self.speed
+            self.pause_at, self.speed = index, None
+            self._set("running")
+            self._cv.notify_all()
 
     def restart(self, paused: bool = False):
         """Throw the session away and start a fresh one from the first candle (a new session id, nothing shared)."""
-        self.stop()
+        self.stop(silent=True)
         self._thread = None
         self.start(paused=paused)
 
@@ -351,6 +406,12 @@ class ReplayController:
                             self._cv.wait(gap / max(1, len(frames)))
                         self.on_forming(f)
                 s.step()
+                if self.pause_at is not None and s.next > self.pause_at:
+                    with self._cv:
+                        self.pause_at, self.speed = None, self._speed_before
+                        self._set("paused")
+                    if not s.finished:
+                        continue
                 if s.finished:
                     self._set("finished")
                     return

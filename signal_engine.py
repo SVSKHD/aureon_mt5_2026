@@ -17,10 +17,17 @@ LIVE_LABELS = {labels.GAP_WIDENING, labels.PARALLEL, labels.WIDE_GAP, labels.GAP
                labels.RE_ENTRY, labels.PULLBACK_FAILED, labels.PRE_CROSS, labels.PRE_CROSS_FAILED}
 
 
+def add_emas(df: pd.DataFrame, periods) -> pd.DataFrame:
+    """In place (and returned): ema<p> for every period (EWM of the close, adjust=False: causal, the MT5 formula).
+    THE one EMA implementation: the live 8/32/200 and any strategy's EMAs (e.g. 20/50) come from here."""
+    for p in periods:
+        df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
+    return df
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """In place (and returned): ema8/ema32/ema200 (EWM, adjust=False: causal) and atr (14-bar mean true range)."""
-    for p in (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND):
-        df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
+    add_emas(df, (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND))
     tr = pd.concat([df["high"] - df["low"],
                     (df["high"] - df["close"].shift()).abs(),
                     (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)

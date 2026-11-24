@@ -562,6 +562,36 @@ def build_discord_client():
         await answer(inter, await ask("notify_mode", {"mode": mode.value, "user": inter.user.id,
                                                       "channel": inter.channel_id}))
 
+    async def simple_reply(inter, cmd: str, payload: dict | None = None, scope: str = "read", wait_s: float = 15.0):
+        """One shared path for the read-only / single-step commands: permission, defer, signed request, answer."""
+        if not await allowed(inter, scope=scope):
+            return
+        await inter.response.defer()
+        reply = await ask(cmd, {**(payload or {}), "user": inter.user.id, "channel": inter.channel_id}, wait_s=wait_s)
+        await answer(inter, reply, button_view(reply.get("buttons")))
+
+    @tree.command(name="mt5_health", description="MT5 connection health: state, cause, account check, order permission")
+    async def mt5_health_cmd(inter: discord.Interaction):
+        await simple_reply(inter, "mt5_health")
+
+    @tree.command(name="mt5_connection", description="MT5 connection timeline: disconnections, attempts, restarts, recoveries")
+    async def mt5_connection_cmd(inter: discord.Interaction):
+        await simple_reply(inter, "mt5_connection")
+
+    @tree.command(name="mt5_reconnect", description="Reconnect to MT5 now and re-check the account (never sends an order)")
+    async def mt5_reconnect_cmd(inter: discord.Interaction):
+        await simple_reply(inter, "mt5_reconnect", scope="trade", wait_s=30.0)
+
+    @tree.command(name="replay_status", description="What the Replay Lab (HISTORICAL REPLAY) is doing on this PC")
+    async def replay_status_cmd(inter: discord.Interaction):
+        await simple_reply(inter, "replay_status")
+
+    @tree.command(name="notification_mode", description="Notification mode: show it, or switch it (same as /notify + /notify_mode)")
+    @app_commands.choices(mode=[app_commands.Choice(name=m.capitalize(), value=m) for m in C.NOTIFY_MODES])
+    async def notification_mode_cmd(inter: discord.Interaction, mode: app_commands.Choice[str] | None = None):
+        await simple_reply(inter, "notification_mode", {"mode": mode.value} if mode else {"action": "status"},
+                           scope="trade" if mode else "read")
+
     TRADE_ACTIONS = {"apply", "close"}                              # need the user listed in DISCORD_ALLOWED_USER_IDS
 
     async def on_button(inter: discord.Interaction, custom_id: str):

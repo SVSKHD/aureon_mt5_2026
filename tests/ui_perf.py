@@ -17,7 +17,7 @@ SAMPLE = os.path.join(HERE, "data", "XAUUSD_M30_sample_20260901_20261030.csv")
 WEB = os.path.join(ROOT, "replay", "app", "web")
 
 
-def record(per_batch: int, start="2026-10-01", end="2026-10-31") -> tuple[list, dict]:
+def record(per_batch: int, start="2026-10-01", end="2026-10-31", strategy="ema_cross") -> tuple[list, dict]:
     """Messages exactly as the desktop host sends them, `per_batch` candles per frame."""
     os.environ.setdefault("AUREON_DATA", tempfile.mkdtemp(prefix="aureon_perf_"))
     import replay  # noqa: F401  (MT5 stub where MetaTrader5 is not installed)
@@ -28,7 +28,7 @@ def record(per_batch: int, start="2026-10-01", end="2026-10-31") -> tuple[list, 
     h = Host(send=sent.append)
     h.post(h.config_msg())
     p = api.prepare(api.Request(start=start, end=end, source="csv", csv_path=SAMPLE, csv_tz="utc",
-                                strategy="ema_cross", out_dir=os.path.join(os.environ["AUREON_DATA"], "perf")))
+                                strategy=strategy, out_dir=os.path.join(os.environ["AUREON_DATA"], "perf")))
     h.prepared = p
     h._session_msg(p.session)
     h.pump()
@@ -78,7 +78,7 @@ def pct(xs, q):
     return round(xs[min(len(xs) - 1, int(q * len(xs)))], 2) if xs else None
 
 
-def run(per_batches=(1, 4, 16)) -> dict:
+def run(per_batches=(1, 4, 16), strategies=("ema_cross", "ema_20_50_basic")) -> dict:
     from playwright.sync_api import sync_playwright
     out = {"chromium": None, "cases": []}
     with sync_playwright() as pw:
@@ -87,8 +87,8 @@ def run(per_batches=(1, 4, 16)) -> dict:
         except Exception:                                 # a pre-installed Chromium of another Playwright build
             browser = pw.chromium.launch(executable_path=os.environ.get("CHROMIUM_PATH", "/opt/pw-browsers/chromium"))
         out["chromium"] = browser.version
-        for n in per_batches:
-            msgs, truth = record(n)
+        for strategy, n in [(st, n) for st in strategies for n in per_batches]:
+            msgs, truth = record(n, strategy=strategy)
             tmp = tempfile.mkdtemp(prefix="aureon_ui_")
             site = os.path.join(tmp, "web")
             shutil.copytree(WEB, site)
@@ -107,7 +107,10 @@ def run(per_batches=(1, 4, 16)) -> dict:
               const c = window.__chart;
               const d = c.candles.data();
               const e200 = c.ema.ema200.data();
+              const cl = c.cloud.data();
+              const e20 = c.cloudLines ? c.cloudLines.ema20.data() : [];
               return { n: d.length, last: d[d.length - 1].time, e200last: e200[e200.length - 1].value,
+                       cloud: cl.length, e20last: e20.length ? e20[e20.length - 1].value : null,
                        resets: c.stats.resets, markers: c.markers.markers().length,
                        bodyText: document.body.innerText.includes('TradingView') };
             }""")
@@ -142,11 +145,14 @@ def run(per_batches=(1, 4, 16)) -> dict:
                 c.apply([{ i: 0, time: iso, utc: iso + '+00:00', open: p, high: p + 1, low: p - 1, close: p }], [], null); }
             }""")
             after = page.evaluate("() => window.__chart.chart.timeScale().getVisibleLogicalRange()")
-            shot = os.path.join(tmp, f"replay_ui_{n}.png")
+            shot = os.path.join(tmp, f"replay_ui_{strategy}_{n}.png")
             page.screenshot(path=shot)
             page.close(); httpd.shutdown()
             out["cases"].append({
-                "candles_per_frame": n, "batches": batches, "frames": len(frames),
+                "strategy": strategy, "candles_per_frame": n,
+                "cloud_points": check["cloud"],
+                "ema20_matches_engine": (check["e20last"] is None and "ema20" not in last_bar) or
+                                        (check["e20last"] is not None and abs(check["e20last"] - last_bar.get("ema20", 1e18)) < 1e-9), "batches": batches, "frames": len(frames),
                 "frame_ms_p50": pct(frames, 0.5), "frame_ms_p95": pct(frames, 0.95), "frame_ms_max": pct(frames, 1.0),
                 "fps_mean": round(1000 / statistics.mean(frames), 1) if frames else None,
                 "batch_apply_ms_max": round(res["stats"]["maxBatchMs"], 2), "candle_updates": res["stats"]["updates"],
@@ -174,6 +180,11 @@ class UiPerformance(unittest.TestCase):
             self.skipTest("UI not built")
         res = run(per_batches=(1, 16))
         for c in res["cases"]:
+            self.assertTrue(c["ema20_matches_engine"])
+            if c["strategy"] == "ema_20_50_basic":
+                self.assertEqual(c["cloud_points"], c["chart_candles"])           # a cloud point on every candle
+            else:
+                self.assertEqual(c["cloud_points"], 0)                            # EMA 8/32 strategies: no cloud
             self.assertEqual(c["page_errors"], [])
             self.assertEqual(c["chart_candles"], c["warmup_plus_revealed"])      # nothing beyond the revealed candle
             self.assertTrue(c["last_chart_time_is_last_revealed"])

@@ -85,6 +85,7 @@ class Guardian:
         self.cooldown_until_wall = 0.0
         self.manual = None                            # {"cause", "reason"} until a healthy, verified look
         self.notified: set = set()
+        self.on_change = None                         # () -> None, after every state change (the bot's status card)
         self._load()
 
     # ------------------------------------------------------------------------------------- persistence
@@ -123,6 +124,11 @@ class Guardian:
         self.timeline.append(row)
         del self.timeline[:-TIMELINE_KEEP]
         self._save()
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                log.exception("on_change failed")
         lvl = logging.WARNING if state not in ("CONNECTED", "RECOVERED") else logging.INFO
         log.log(lvl, "MT5 connection %s -> %s (%s) %s", prev, state, cause, detail)
         try:

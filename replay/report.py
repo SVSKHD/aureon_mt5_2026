@@ -13,10 +13,33 @@ import config as C
 
 
 def performance(session) -> dict | None:
-    """Virtual-trade statistics (None for an indicator-only replay)."""
+    """Virtual-trade statistics of the primary account (None for an indicator-only replay)."""
     if not session.strategy.trades:
         return None
-    b = session.broker
+    return account_performance(session.strategy, session.broker)
+
+
+def _max_run(flags) -> int:
+    best = cur = 0
+    for f in flags:
+        cur = cur + 1 if f else 0
+        best = max(best, cur)
+    return best
+
+
+def _exit_kind(reason: str | None) -> str:
+    r = (reason or "").lower()
+    if r.startswith("sl"):
+        return "stop-loss" + (" (ambiguous candle)" if "ambiguous" in r else " (gap)" if "gap" in r else "")
+    if r.startswith("tp"):
+        return "take-profit"
+    if r.startswith("end of replay"):
+        return "end of replay"
+    return "strategy exit"
+
+
+def account_performance(strategy, b) -> dict:
+    """Statistics of one strategy account (shared by the single report and the strategy comparison)."""
     trades = b.closed
     nets = [t.net for t in trades]
     wins, losses = [x for x in nets if x > 0], [x for x in nets if x <= 0]
@@ -48,7 +71,16 @@ def performance(session) -> dict | None:
     dist = Counter(names[max(0, min(len(names) - 1, next(i for i in range(len(bins) - 1) if bins[i] < x <= bins[i + 1])))]
                    for x in nets)
     gp, gl = sum(wins), -sum(losses)
-    return {"strategy": session.strategy.describe(), "trades": len(trades), "wins": len(wins), "losses": len(losses),
+    rs = [t.r_multiple for t in trades if t.r_multiple is not None]
+    spread_cost = sum(b.spec.money(b.costs.spread, t.lots) for t in trades)
+    slip_cost = sum(b.spec.money(b.costs.slippage * 2, t.lots) for t in trades)
+    return {"strategy": strategy.describe(), "trades": len(trades), "wins": len(wins), "losses": len(losses),
+            "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
+            "max_consecutive_losses": _max_run(x <= 0 for x in nets),
+            "entries": dict(Counter(t.entry_signal or t.reason for t in trades)),
+            "exits": dict(Counter(_exit_kind(t.exit_reason) for t in trades)),
+            "costs": {"commission": round(sum(t.commission for t in trades), 2), "spread_estimate": round(spread_cost, 2),
+                      "slippage_estimate": round(slip_cost, 2)},
             "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else None,
             "net": round(sum(nets), 2), "gross_profit": round(gp, 2), "gross_loss": round(gl, 2),
             "profit_factor": round(gp / gl, 3) if gl else None,
@@ -150,8 +182,16 @@ def summary_md(rep: dict) -> str:
            f"digests {dc['digests']} ({dc['events_in_digests']} events) · still waiting {dc['waiting']}")]
     p = rep["performance"]
     if p:
-        L += ["", f"## Virtual trades — strategy `{p['strategy']['name']}` (simulated)",
-              f"- Trades {p['trades']} · wins {p['wins']} · losses {p['losses']} · win rate {p['win_rate']}%",
+        st = p["strategy"]
+        L += ["", f"## Virtual trades — strategy `{st['name']}` v{st['version']} (params {st['param_hash']}, simulated)"]
+        if st.get("experimental"):
+            L += ["", "> ⚠️ EXPERIMENTAL strategy: not the authoritative definition. Unverified: "
+                      + "; ".join(st.get("unverified_rules", [])), ""]
+        L += [f"- Trades {p['trades']} · wins {p['wins']} · losses {p['losses']} · win rate {p['win_rate']}% · "
+              f"average R {p['avg_r']} · max consecutive losses {p['max_consecutive_losses']}",
+              f"- Exits: " + " · ".join(f"{k} {v}" for k, v in p["exits"].items()),
+              f"- Costs: commission {p['costs']['commission']:,.2f} · spread ≈ {p['costs']['spread_estimate']:,.2f} · "
+              f"slippage ≈ {p['costs']['slippage_estimate']:,.2f}",
               f"- Net {p['net']:+,.2f} · profit factor {p['profit_factor']} · expectancy {p['expectancy']}",
               f"- Balance {p['start_balance']:,.2f} → {p['end_balance']:,.2f} · max drawdown {p['max_drawdown']:,.2f} "
               f"({p['max_drawdown_pct']}%)",

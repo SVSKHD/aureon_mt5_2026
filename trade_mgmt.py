@@ -183,6 +183,12 @@ def status_text() -> str:
         lines.append(f"Last change {_s['changed_at']} by {_s['changed_by'] or 'restart policy'}")
     if _s["problem"]:
         lines.append(f"⚠️ state problem at startup: {_s['problem']}")
+    import guardian
+    g = guardian.current()
+    if g is not None:
+        snap = g.snapshot()
+        lines.append(f"**MT5 connection: {snap['state']}**" + (f" ({snap['cause']})" if snap["cause"] != "ok" else "")
+                     + f" · account {snap['account']} · orders {snap['orders']}")
     return "\n".join(lines)
 
 
