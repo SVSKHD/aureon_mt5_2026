@@ -1,0 +1,22 @@
+{
+ "symbol": "XAUUSD",
+ "tf": "M30",
+ "start": "2026-10-01",
+ "end": "2026-10-31",
+ "source": "csv",
+ "csv_path": "tests/data/XAUUSD_M30_sample_20260901_20261030.csv",
+ "csv_tz": "utc",
+ "strategy": "indicators",
+ "params": {},
+ "protective": {},
+ "sizing": {},
+ "trade_management": false,
+ "balance": 50000.0,
+ "spread": 0.3,
+ "commission": 7.0,
+ "slippage": 0.05,
+ "discord": false,
+ "animate": false,
+ "out_dir": "docs/examples/replay_indicators_xauusd_2026-10",
+ "session": "rp-20261124-021429-0067e7"
+}

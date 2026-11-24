@@ -230,13 +230,8 @@ def fetch(tf: str, since: datetime | None = None, symbol: str | None = None) -> 
     df["time"] = pd.to_datetime(df["time"], unit="s")               # naive = MT5 server time
     df.attrs["clamped_from"] = clamped_from
     df.attrs["symbol"] = symbol or C.SYMBOL
-    for p in (C.EMA_FAST, C.EMA_SLOW, C.EMA_TREND):
-        df[f"ema{p}"] = df["close"].ewm(span=p, adjust=False).mean()
-    tr = pd.concat([df["high"] - df["low"],
-                    (df["high"] - df["close"].shift()).abs(),
-                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
-    return df
+    import signal_engine
+    return signal_engine.add_indicators(df)                       # shared with the historical replay
 
 
 def ema_status(df: pd.DataFrame, price: float) -> str:

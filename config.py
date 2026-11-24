@@ -272,6 +272,51 @@ except ValueError:
     TRADE_MANAGEMENT_USER_IDS = {-1}                               # malformed: nobody (fail closed)
 TRADE_MANAGEMENT_CONFIRM_SECONDS = 30
 
+# ---- Replay Lab (replay/): historical replay and backtests. Read ONLY by the replay tools, never by the live bot.
+# Everything simulated; nothing here can reach the live order path, the live alert channels or the live state.
+REPLAY_DISCORD_ENABLED = env("REPLAY_DISCORD_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+REPLAY_DISCORD_WEBHOOK = env("REPLAY_DISCORD_WEBHOOK")             # a DEDICATED replay channel webhook
+REPLAY_DISCORD_RATE_LIMIT = env("REPLAY_DISCORD_RATE_LIMIT", "5")  # messages per second (Discord 429s are honoured)
+REPLAY_DISCORD_QUEUE = env("REPLAY_DISCORD_QUEUE", "200")          # cards waiting before older ones become digests
+REPLAY_TRADE_MANAGEMENT_ENABLED = env("REPLAY_TRADE_MANAGEMENT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+REPLAY_ACCOUNT_BALANCE = env("REPLAY_ACCOUNT_BALANCE", "50000")
+REPLAY_EXECUTION_MODE = env("REPLAY_EXECUTION_MODE", "simulation").strip().lower()   # only "simulation" exists
+REPLAY_SPREAD = env("REPLAY_SPREAD", "0.30")                       # price units added on the ask side
+REPLAY_COMMISSION_PER_LOT = env("REPLAY_COMMISSION_PER_LOT", "7.0")   # account currency per lot, round turn
+REPLAY_SLIPPAGE = env("REPLAY_SLIPPAGE", "0.05")                   # price units against you on market/stop fills
+
+
+def replay_problems() -> list[str]:
+    """Problems in the REPLAY_* settings (checked by the replay tools only; the live bot ignores them)."""
+    bad = []
+    if REPLAY_EXECUTION_MODE != "simulation":
+        bad.append("REPLAY_EXECUTION_MODE must be simulation (the Replay Lab never trades)")
+    for key in ("REPLAY_DISCORD_RATE_LIMIT", "REPLAY_DISCORD_QUEUE", "REPLAY_ACCOUNT_BALANCE"):
+        try:
+            if float(globals()[key]) <= 0:
+                raise ValueError
+        except ValueError:
+            bad.append(f"{key} must be a number greater than 0")
+    for key in ("REPLAY_SPREAD", "REPLAY_COMMISSION_PER_LOT", "REPLAY_SLIPPAGE"):
+        try:
+            if float(globals()[key]) < 0:
+                raise ValueError
+        except ValueError:
+            bad.append(f"{key} must be a number of 0 or more")
+    if REPLAY_DISCORD_ENABLED and not REPLAY_DISCORD_WEBHOOK:
+        bad.append("REPLAY_DISCORD_ENABLED needs REPLAY_DISCORD_WEBHOOK (a dedicated replay channel)")
+    live = {u for u in [DISCORD_WEBHOOK, SLACK_WEBHOOK, *DISCORD_WEBHOOKS.values()] if u}
+    if REPLAY_DISCORD_WEBHOOK and (REPLAY_DISCORD_WEBHOOK in live or
+                                   _webhook_id(REPLAY_DISCORD_WEBHOOK) in {_webhook_id(u) for u in live}):
+        bad.append("REPLAY_DISCORD_WEBHOOK is a LIVE alert webhook: create a separate replay channel and webhook")
+    return bad
+
+
+def _webhook_id(url: str) -> str:
+    """The id part of a Discord webhook URL (.../webhooks/<id>/<token>), so two spellings of one hook match."""
+    parts = [p for p in str(url).split("/") if p]
+    return parts[parts.index("webhooks") + 1] if "webhooks" in parts and parts.index("webhooks") + 1 < len(parts) else url
+
 # ---------------------------------------------------------------- folders
 # Everything the bot writes lives under logs/ (override root with AUREON_DATA):
 #   logs/state/    state.json(.bak), alerts.json(.bak), heartbeat.json, watchdog.lock
