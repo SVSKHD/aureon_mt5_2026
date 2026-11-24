@@ -14,6 +14,7 @@ import MetaTrader5 as mt5
 import config as C
 import signals, notifier, alerts, chart, trader, store, labels, positions, monitor, weekend, report, updater
 import uploader
+import signal_engine
 import notify, trade_mgmt
 
 C.migrate_legacy_files()
@@ -379,7 +380,7 @@ def check_ema(tf: str, symbol: str | None = None):
         bar_close = bar_time.to_pydatetime() + timedelta(minutes=bar_min)
         is_missed = (now_srv - bar_close).total_seconds() > C.MISSED_GRACE_SECONDS
         closed_blind = bool(catch_up) and catch_up[0] <= bar_close <= catch_up[1]   # closed while MT5 was down
-        key = f"{symbol}:{tf}:{e['type']}:{e['dir']}:{e.get('episode', str(bar_time))}"
+        key = signal_engine.event_key(symbol, tf, bar_time, e)
         if state.seen(key) or key in seen_now:
             continue
         seen_now.add(key)
@@ -460,8 +461,7 @@ def _fold_quiet(live):
 
 
 LABELS: dict = {}                                                  # symbol -> labels.Result for the newest closed bar
-LIVE_LABELS = {labels.GAP_WIDENING, labels.PARALLEL, labels.WIDE_GAP, labels.GAP_PEAKED, labels.PULLBACK,
-               labels.RE_ENTRY, labels.PULLBACK_FAILED, labels.PRE_CROSS, labels.PRE_CROSS_FAILED}
+LIVE_LABELS = signal_engine.LIVE_LABELS                            # shared with the historical replay (replay/)
 def _pre_cross_button(symbol, tf, bt, e):
     """A pre-cross is a WATCH signal: its only button is Monitor (no Place, no entry, no SL)."""
     if e["type"] == labels.PRE_CROSS:
@@ -524,40 +524,12 @@ def warm_start():
             positions.on_candle(state, sym, df, lab, [])
 
 
-def _dir(side: int) -> str:
-    return "BULL" if side > 0 else "BEAR"
-
-
-def label_event(le: dict) -> dict:
-    """labels.py event -> the bot's event dict (type/dir/price + details)."""
-    e = {k: v for k, v in le.items() if k not in ("i", "time", "label", "side")}
-    e["type"] = le["label"]
-    if le["label"] in (labels.PRE_CROSS, labels.PRE_CROSS_FAILED):
-        e["dir"] = _dir(le.get("expect", -le["side"]))               # the cross it is waiting for
-        e["episode"] = f"{le['pair']}:{le['time']}"
-    else:
-        e["dir"] = "LONG" if le["side"] > 0 else "SHORT"
-    return e
+label_event = signal_engine.label_event                            # pure, shared with the historical replay
 
 
 def candle_events(df, todo: int, tf: str, symbol: str, lab=None):
-    """(bar_time, event) for every candle in the last `todo` closed candles, oldest first: the cross and EMA200
-    events from signals.detect(), then the labels of that candle."""
-    by_time: dict = {}
-    for le in (lab.events if lab else []):
-        by_time.setdefault(le["time"], []).append(le)
-    for back in range(todo - 1, -1, -1):                           # oldest -> newest
-        sub = df.iloc[:len(df) - back]
-        bar_time = sub["time"].iloc[-1]
-        here = by_time.get(bar_time, [])
-        cross = next((le for le in here if le["label"] == labels.CROSS), None)
-        for e in signals.detect(sub):
-            if e["type"].startswith("CROSS") and cross:          # the label engine adds the tag and what finished
-                e.update(tag=cross["tag"], lesser_gap=cross["lesser_gap"], finished=cross["finished"])
-            yield bar_time, e
-        for le in here:
-            if le["label"] in LIVE_LABELS:
-                yield bar_time, label_event(le)
+    """(bar_time, event) for every candle in the last `todo` closed candles, oldest first (signal_engine)."""
+    return signal_engine.candle_events(df, todo, lab)
 
 
 def market_status(symbol: str) -> str:
